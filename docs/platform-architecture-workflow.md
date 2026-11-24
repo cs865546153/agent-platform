@@ -76,7 +76,7 @@
                                 ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │ 4. 领域注册 [新增]                                                 │
-│    DomainRegistry ← configs/domains.yaml                           │
+│    DomainRegistry ← 插件 manifest.yaml（YAML 回退补齐）           │
 │    校验：domain、intent 必须存在                                   │
 └───────────────────────────────┬────────────────────────────────────┘
                                 ▼
@@ -145,7 +145,7 @@
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ 5. 领域注册 DomainRegistry                                    │
-│    校验 domain + intent 是否在 configs/domains.yaml           │
+│    校验 domain + intent 是否在插件 manifest 聚合的清单中       │
 └──────────────────────────┬───────────────────────────────────┘
                            │
           ┌────────────────┼────────────────┐
@@ -209,7 +209,7 @@ RouteDecision ──判断──┤
       domain     = claims / investment / general（general 为助手图内分流）
       intent     = 领域内具体意图
       confidence / margin
-6. DomainRegistry 校验 domain + intent 是否合法（configs/domains.yaml）
+6. DomainRegistry 校验 domain + intent 是否合法（插件声明聚合，YAML 回退）
 7. 选择执行路径：
       /api/claims/* → ClaimsPlugin 案件状态机；/api/investment/* → InvestmentPlugin；
       /api/assistant/stream → 助手图按意图分流（低风险对话图，高风险案件图）
@@ -432,13 +432,13 @@ INTENT_MARGIN_THRESHOLD=0.2
 | 模块 | 状态 |
 |---|---|
 | `agent_core/intent/contracts.py` | `[新增]` 已落地：`IntentRequest`、`RouteDecision`、`DomainManifest`、`IntentClassifier` |
-| `agent_core/intent/registry.py` | `[新增]` 已落地：从 `configs/domains.yaml` 加载领域 |
+| `agent_core/intent/registry.py` | `[新增]` 已落地：`from_plugins()` 聚合插件 manifest，YAML 回退补齐 |
 | `agent_core/intent/jev.py` | `[新增]` 已落地：JEV 适配器、脱敏、可选翻译、置信度 / 边界纠正 |
 | `agent_core/intent/llm.py` | `[新增]` 已落地：LLM 主路由、可选翻译器 |
 | `agent_core/intent/hybrid.py` | `[新增]` 已落地：主路由 + 兜底 + 影子 |
 | `agent_core/intent/factory.py` | `[新增]` 已落地：`shadow / hybrid / jev / llm` 四种预设 |
 | `agent_core/intent/adapter.py` | `[已接入]` 已落地：`AssistantIntentRouter` 把路由决策转成工作台 `IntentResult` |
-| `configs/domains.yaml` | `[新增]` 已落地：claims / investment / general 领域与意图清单（general 为助手图内分流） |
+| `configs/domains.yaml` | `[新增]` 已落地：领域/意图回退清单（主事实源已随插件 `manifest.yaml`） |
 | `scripts/eval_intent.py` | `[新增]` 已落地：准确率、混淆矩阵、兜底率、影子一致性、延迟 |
 | `data/intent_golden.jsonl` | `[新增]` 已落地：中英混合合成评测集 |
 | `app.py` 接入 IntentRouter | `[已接入]` `build_assistant_intent_router()` + `/api/assistant/stream`；可用 `INTENT_ROUTER_ENABLED=false` 关闭 |
@@ -472,7 +472,8 @@ INTENT_MARGIN_THRESHOLD=0.2
      build_services（依赖装配）+ build_graphs（可选）+ register_routes（领域路由）
      依赖全部从 AppContext 取，不 import app.py
 2. 在 domains/registry.py 的 default_registry() 登记插件（唯一启用开关）
-3. 在 configs/domains.yaml 登记领域与意图（description_en 供英文优先的 JEV 使用）
+3. 在插件目录写 manifest.yaml 声明领域与意图（description_en 供英文优先的 JEV 使用）；
+   内核从插件聚合清单，configs/domains.yaml 仅补齐无插件领域
 4. 用 create_app(registry=PluginRegistry([MyPlugin()])) 写可插拔契约测试
 ```
 
@@ -522,7 +523,7 @@ ObjectStore:  Local    → S3 / OSS
 | `config.py` | 模型工厂与现有两套路由 |
 | `settings.py` | 环境配置，含 `INTENT_ROUTER_ENABLED` / `INTENT_*` / `JEV_*` |
 | `agent_core/intent/` | 意图路由公共层，`adapter.py` 是主链路接入点 |
-| `configs/domains.yaml` | 领域清单，单一事实源 |
+| `configs/domains.yaml` | 领域/意图回退清单；主事实源为各插件 `manifest.yaml` |
 | `scripts/eval_intent.py` | 意图评测脚本 |
 | `data/intent_golden.jsonl` | 意图评测数据 |
 

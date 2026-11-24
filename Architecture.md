@@ -39,7 +39,7 @@
 【内核能力层】 agent_core/ —— 领域无关
   plugins.py  : DomainPlugin 协议、AppContext、PluginRegistry
   security.py : 认证与生产密钥校验；sse.py : SSE 帧编码
-  intent/     : JEV / LLM / Hybrid / Shadow 意图路由（领域清单来自 configs/domains.yaml）
+  intent/     : JEV / LLM / Hybrid / Shadow 意图路由（领域清单从插件 manifest 聚合，YAML 回退）
        |
        v
 【编排层】（领域图由各插件构建，checkpointer 由内核在 lifespan 注入）
@@ -119,8 +119,24 @@ create_app(registry)
   -> 兼容字段 application.state.graph / investment_graph 供既有 demo 路由使用
 ```
 
-`AppContext` 持有 `services` / `graphs` / `locks` / `settings` / `application`，
-是内核与插件之间唯一的依赖通道；插件不直接 import `app.py`。
+`AppContext` 持有 `services` / `graphs` / `locks` / `settings` / `application` /
+`intent_router` / `intent_registry`，是内核与插件之间唯一的依赖通道；插件不直接 import `app.py`。
+
+**意图路由同样可插拔**（领域与意图事实源随插件走，内核不再写死）：
+
+```text
+插件 manifest.yaml（intent_manifest hook）
+  -> DomainRegistry.from_plugins(plugins, fallback=DomainRegistry.default())
+       插件声明优先；YAML 只补齐无插件领域（如 general 的助手图内分流）
+  -> build_assistant_intent_router(cfg, intent_model, domain_registry)
+       create_app(intent_router=...) 显式注入时跳过构建，内核不接管其生命周期
+  -> IntentRoutingPolicy.from_registry(...)  # 意图名 -> 图内分支的映射从清单派生
+  -> assistant 图的 general / investment / trade / policy / material 分支
+```
+
+`configs/domains.yaml` 退居回退清单：新增领域只需在插件目录写 `manifest.yaml`，
+无需改全局 YAML、也无需改 `assistant_agent.py` 的意图字符串。契约由
+`tests/test_intent_plugin_template.py` 守护。
 
 **领域无关的横切能力**（对全部领域一律生效，插件无需重复实现）：审计哈希链
 （`agents/audit_store.py`）、接入限流与 500 兜底（`agents/http_middleware.py`）、
@@ -168,7 +184,8 @@ HTTP 路由（无模型，静态 URL 匹配）
 
 ```python
 # app.py：启动时按配置构建一次，失败降级为内置分类
-router = build_assistant_intent_router(cfg, intent_model)      # agent_core/intent/factory.py
+registry = DomainRegistry.from_plugins(plugins, fallback=DomainRegistry.default())  # 插件声明优先
+router = build_assistant_intent_router(cfg, intent_model, registry)  # 可注入；显式 router 时跳过构建
 # agents/assistant_agent.py：classify 节点优先走路由层
 route = await intent_router.classify(question=..., history=..., active_domain=...)
 intent = IntentResult(intent=route.intent, confidence=route.confidence, policy_id=route.policy_id)

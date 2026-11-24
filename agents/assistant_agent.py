@@ -60,6 +60,71 @@ INVESTMENT_INTENTS = frozenset({'投资咨询', '组合诊断', '风险评估', 
 GENERAL_INTENTS = frozenset({'一般咨询'})
 
 
+class IntentRoutingPolicy:
+    """把"意图名 → 图内分支"的映射从图代码里抽出来，可由领域清单派生。
+
+    模板化的关键：新增领域只要声明自己的意图，就能被路由到正确分支，
+    不必改 ``assistant_agent.py`` 里的硬编码字符串。
+
+    - ``general_intents``  → 通用回答分支（stage=general）
+    - ``investment_intents`` → 投资回答分支（stage=investment）
+    - ``trade_intent`` → 拦截下单，走 investment_trade 节点
+    - ``policy_intent`` → 走 policy_query 节点
+    - ``material_intents`` → 走材料门控/正式核赔
+    """
+
+    def __init__(
+        self,
+        *,
+        general_intents: frozenset[str] = GENERAL_INTENTS,
+        investment_intents: frozenset[str] = INVESTMENT_INTENTS,
+        trade_intent: str = '交易指令',
+        policy_intent: str = '保单查询',
+        material_intents: frozenset[str] = frozenset({'理赔报案', '材料审核', '补充材料'}),
+    ) -> None:
+        self.general_intents = general_intents
+        self.investment_intents = investment_intents
+        self.trade_intent = trade_intent
+        self.policy_intent = policy_intent
+        self.material_intents = material_intents
+
+    @classmethod
+    def from_registry(cls, registry: Any) -> "IntentRoutingPolicy":
+        """从 ``DomainRegistry`` 派生路由策略；未知领域名忽略，保持默认。
+
+        领域清单里 ``general`` / ``investment`` 的意图按领域名归类；
+        高风险 + case 模式的意图作为交易拦截意图；带 ``policy_query``
+        capability 的领域里名为"保单查询"的意图作为保单查询意图。
+        """
+        if registry is None:
+            return cls()
+        general: set[str] = set()
+        investment: set[str] = set()
+        trade: str | None = None
+        policy: str | None = None
+        material: set[str] = set()
+        for domain in registry.all():
+            names = {spec.name for spec in domain.intents}
+            if domain.name == 'general':
+                general |= names
+            elif domain.name == 'investment':
+                investment |= names
+                for spec in domain.intents:
+                    if spec.risk == 'high' or spec.mode == 'case':
+                        trade = trade or spec.name
+            elif domain.name == 'claims':
+                material |= names & {'理赔报案', '材料审核', '补充材料'}
+                if 'policy_query' in (domain.capabilities or ()) and '保单查询' in names:
+                    policy = policy or '保单查询'
+        return cls(
+            general_intents=frozenset(general) if general else GENERAL_INTENTS,
+            investment_intents=frozenset(investment) if investment else INVESTMENT_INTENTS,
+            trade_intent=trade or '交易指令',
+            policy_intent=policy or '保单查询',
+            material_intents=frozenset(material) if material else frozenset({'理赔报案', '材料审核', '补充材料'}),
+        )
+
+
 GENERAL_PROMPT = (
     '你是通用智能助手。直接回答用户的非理赔问题，语言清晰、准确。'
     '对于实时信息、医疗、法律或金融等需要外部数据或专业判断的问题，'
@@ -135,27 +200,34 @@ def _conversation(question: str, history: list[Any], system_prompt: str) -> list
     return messages
 
 
-def active_domain_from_history(history: list[Any]) -> str | None:
+def active_domain_from_history(
+    history: list[Any], policy: IntentRoutingPolicy | None = None
+) -> str | None:
     """从上一轮意图推断当前领域；JEV 仅在消息有歧义时使用该提示。"""
+    policy = policy or IntentRoutingPolicy()
     last_intent = next(
         (getattr(turn, 'intent', None) for turn in reversed(history) if getattr(turn, 'intent', None)),
         None,
     )
-    if last_intent is None or last_intent in GENERAL_INTENTS:
+    if last_intent is None or last_intent in policy.general_intents:
         return None
-    return 'investment' if last_intent in INVESTMENT_INTENTS else 'claims'
+    return 'investment' if last_intent in policy.investment_intents else 'claims'
 
 
 def build_assistant_graph(*, classifier: Any, general_model: Any,
                           assistant_model: Any, service: Any,
                           investment_model: Any = None,
                           investment_rag: Any = None,
-                          intent_router: Any = None) -> Any:
+                          intent_router: Any = None,
+                          routing_policy: IntentRoutingPolicy | None = None) -> Any:
     """构建无状态对话助手图；依赖经闭包注入，节点为 async 编排函数。
 
     ``intent_router`` 是 ``agent_core.intent.adapter.AssistantIntentRouter``：
     接入后优先走 JEV/LLM/Hybrid 路由，失败或契约不符时回落到内置分类模型。
+    ``routing_policy`` 决定意图到图内分支的映射；不传时用默认策略（兼容旧行为），
+    内核装配时从领域插件的 manifest 派生。
     """
+    policy = routing_policy or IntentRoutingPolicy()
 
     async def _route_intent(state: AssistantState,
                             classification_messages: list[Any]) -> tuple[Any, Any, str | None]:
@@ -167,7 +239,7 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
                     question=state['question'],
                     history=state['history'],
                     attachments=state['documents'],
-                    active_domain=active_domain_from_history(state['history']),
+                    active_domain=active_domain_from_history(state['history'], policy),
                 )
                 return (
                     IntentResult(intent=route.intent, confidence=route.confidence,
@@ -254,17 +326,17 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
         material_continuation = state['material_round'] > 0 and any(
             token in state['question'] for token in MATERIAL_TOKENS
         )
-        if intent.intent == '一般咨询' and not material_continuation:
+        if intent.intent in policy.general_intents and not material_continuation:
             llm = general_model
             messages = _conversation(state['question'], state['history'],
                                      GENERAL_PROMPT + f'用户已上传资料摘要：{state["context"]}')
             stage = 'general'
             needs_llm_answer = True
-        elif intent.intent in INVESTMENT_INTENTS:
+        elif intent.intent in policy.investment_intents:
             llm = investment_model or general_model
             stage = 'investment'
-            # 交易指令不检索知识库，也不允许模型直接回答；由外层转人工/确认流程。
-            needs_llm_answer = intent.intent != '交易指令'
+            # 交易类意图不检索知识库，也不允许模型直接回答；由外层转人工/确认流程。
+            needs_llm_answer = intent.intent != policy.trade_intent
             messages = []
         else:
             llm = assistant_model
@@ -414,7 +486,7 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
     async def material_gate(state: AssistantState) -> dict[str, Any]:
         events: list[dict[str, Any]] = []
         material_check = check_claim_materials(state['documents'])
-        should_check = state['material_continuation'] or state['intent'] in ('理赔报案', '材料审核', '补充材料')
+        should_check = state['material_continuation'] or state['intent'] in policy.material_intents
         extracted_fields = {
             key.replace('_', '').replace(' ', '').lower(): value
             for document in state['documents']
@@ -614,13 +686,13 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
         return {'events': events, 'needs_llm_answer': False}
 
     def route_after_classify(state: AssistantState) -> str:
-        if state['intent'] == '交易指令':
+        if state['intent'] == policy.trade_intent:
             return 'investment_trade'
         if state['stage'] == 'general':
             return 'answer'
         if state['stage'] == 'investment':
             return 'answer'
-        if state['intent'] == '保单查询':
+        if state['intent'] == policy.policy_intent:
             return 'policy_query'
         return 'material_gate'
 

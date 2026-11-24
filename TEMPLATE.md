@@ -14,10 +14,10 @@
 app.py                     内核：FastAPI 装配 + 通用路由 + 健康检查/RAG/工作台/SSE
   └─ create_app(registry=)  唯一扩展点：注入领域插件集，Kernel 不认识任何业务
 agent_core/                领域无关内核
-  ├─ plugins.py            DomainPlugin 协议、AppContext、PluginRegistry
+  ├─ plugins.py            DomainPlugin 协议（含 intent_manifest hook）、AppContext、PluginRegistry
   ├─ security.py           API Key / 审核员认证、生产密钥校验
   ├─ sse.py                SSE 帧编码
-  └─ intent/               JEV/LLM/Hybrid/Shadow 意图路由（领域清单来自 configs/domains.yaml）
+  └─ intent/               JEV/LLM/Hybrid/Shadow 意图路由（领域清单从插件 manifest 聚合）
 domains/                   领域插件（可增删）
   ├─ registry.py           默认领域登记表（唯一"启用哪些领域"的事实源）
   ├─ base.py               插件基类 + LangGraph 中断/配置共用辅助
@@ -38,7 +38,7 @@ domains/                   领域插件（可增删）
 | --- | --- | --- |
 | RequestID / 认证 / 限流 / 审计 / 500 兜底 | `agents/http_middleware.py` | 否 |
 | append-only + 哈希链审计 | `agents/audit_store.py` | 否 |
-| 意图分类 JEV/LLM/Hybrid/Shadow | `agent_core/intent/` | 仅需登记意图 |
+| 意图分类 JEV/LLM/Hybrid/Shadow | `agent_core/intent/` | 在插件 manifest.yaml 声明意图即可 |
 | 模型工厂 / 任务档位 / 缓存 / 降级 | `config.py`、`agents/middleware_audit.py` | 否 |
 | 多路召回 + RRF + BGE-Rerank + 引用校验 | `tools/knowledge_rag.py`、`tools/rerank.py` | 可选复用 |
 | HITL（中断 + 恢复 + 人工审批） | LangGraph `interrupt` + `Command(resume=)` | 图内声明 |
@@ -48,7 +48,7 @@ domains/                   领域插件（可增删）
 
 ---
 
-## 3. 新增一个领域（三步）
+## 3. 新增一个领域（四步）
 
 以 `domains/example/` 为骨架：
 
@@ -78,7 +78,32 @@ class MyDomainPlugin(DomainPluginBase):
         register_routes(ctx)
 ```
 
-### 步骤 2：登记领域
+`DomainPluginBase.intent_manifest()` 会自动加载插件目录下的 `manifest.yaml`，
+领域与意图声明从此随插件走，不必改全局 YAML（见步骤 2）。
+
+### 步骤 2：声明领域意图（随插件走，可选但推荐）
+
+```yaml
+# domains/my_domain/manifest.yaml —— 与 configs/domains.yaml 单个领域条目同格式
+name: my_domain
+description: 我的业务领域
+description_en: "My business domain"   # JEV 英文优先，务必提供
+version: 0.1.0
+capabilities: []
+intents:
+  - name: 我的意图
+    description: 用户会怎么表达
+    description_en: "How users express it"
+    examples: ["一个示例问题"]
+    risk: low
+    mode: conversation
+```
+
+内核启动时从已启用插件的 `intent_manifest()` 聚合领域清单，
+`configs/domains.yaml` 只用于补齐没有插件的领域（如 general）；
+意图路由器的构建、保单号兜底抽取、图内分支策略都从这份聚合清单派生。
+
+### 步骤 3：登记领域
 
 ```python
 # domains/registry.py —— 唯一的启用开关
@@ -88,17 +113,19 @@ def default_registry() -> PluginRegistry:
     return PluginRegistry([ClaimsPlugin(), InvestmentPlugin(), MyDomainPlugin()])
 ```
 
-同时在 `configs/domains.yaml` 登记领域与意图（供意图路由器识别；`description_en` 供英文优先的 JEV 使用）。
+`configs/domains.yaml` 不再是新增领域的必改项；它只保留无插件领域的声明。
 
-### 步骤 3：测试
+### 步骤 4：测试
 
 ```bash
-pytest -q tests/test_domain_plugin_template.py   # 可插拔契约回归
+pytest -q tests/test_domain_plugin_template.py   # 领域可插拔契约
+pytest -q tests/test_intent_plugin_template.py   # 意图路由可插拔契约
 pytest -q                                         # 全量
 ```
 
 测试里可用 `create_app(registry=PluginRegistry([MyDomainPlugin()]))` 只装自己的域，
-与新领域无关的路由不会注册（见 `test_domain_plugin_template.py`）。
+与新领域无关的路由不会注册；也可用 `intent_router=FakeRouter()` 显式注入意图路由，
+内核会跳过构建且不接管其生命周期（见两个契约测试文件）。
 
 ---
 
@@ -118,7 +145,7 @@ pytest -q                                         # 全量
 
 ## 5. 验证基线（2026-11-24）
 
-- `191 passed, 1 skipped`（原 188 + 新增 3 条领域可插拔契约测试；跳过项为需真实 Milvus 的集成测试）
+- `196 passed, 1 skipped`（原 188 + 3 条领域可插拔 + 5 条意图路由可插拔契约测试；跳过项为需真实 Milvus 的集成测试）
 - Ruff（F 规则）全项目通过；新增领域模块 Mypy 通过
 - 可插拔契约由 `tests/test_domain_plugin_template.py` 守护
 - 真实启动：`bash scripts/start_mac.sh` 后 `/health`、`/ready`、首页与 19 个路由均 200；

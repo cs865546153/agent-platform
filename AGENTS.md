@@ -78,7 +78,7 @@ domains/                领域插件（可增删，新增领域不改内核）
   investment/           示例域：投资服务装配、图、核心路由
   example/              最小示例：演示新领域如何接入
 TEMPLATE.md             模板定位、内核/领域边界、新增领域三步指南
-configs/domains.yaml    领域与意图单一事实源（含 description_en）
+configs/domains.yaml    领域/意图回退清单（含 description_en）；主事实源已随插件 manifest.yaml
 data/investment_wiki/   投资 Wiki 源文件（约 55 chunks）
 data/knowledge_base/    通用知识库源文件（当前约 3 chunks）
 data/intent_golden.jsonl 意图评测集（39 条合成样本）
@@ -248,8 +248,9 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
 
 代码与配置：
 
-- `app.py`：`build_assistant_intent_router(cfg, intent_model)` 启动时构建一次，
-  存入 `application.state.intent_router`，关闭时 `aclose()`；初始化失败只记 warning。
+- `app.py`：`build_assistant_intent_router(cfg, intent_model, domain_registry)` 装配时构建一次，
+  领域清单从插件 `intent_manifest()` 聚合；显式传 `create_app(intent_router=...)` 时跳过构建。
+  存入 `application.state.intent_router`，仅内核自建时 `aclose()`；初始化失败只记 warning。
 - `agent_core/intent/adapter.py`：`AssistantIntentRouter` 把工作台请求转成
   `IntentRequest`，并把 `RouteDecision` 转成 `IntentResult`（含保单号兜底抽取）。
 - `agent_core/intent/jev.py`：`JevIntentClassifier`，调用 `ateve-jev-v1` 兼容接口；
@@ -260,8 +261,10 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
   主路由异常记 `intent.primary_failed`，低置信记 `intent.primary_low_confidence`，
   最终结果再由 `app.py` 记 `intent.route`。
 - `agent_core/intent/factory.py`：`shadow / hybrid / jev / llm` 四种预设。
-- `agent_core/intent/registry.py` + `configs/domains.yaml`：领域/意图注册表，JEV 使用
-  `description_en`，新增意图时务必补英文描述。
+- `agent_core/intent/registry.py`：`DomainRegistry.from_plugins()` 从插件 `manifest.yaml`
+  聚合领域清单，`configs/domains.yaml` 仅回退补齐无插件领域（如 general）。
+  `agents/assistant_agent.py` 的 `IntentRoutingPolicy.from_registry()` 据此派生图内分支，
+  新增领域不要改图代码里的意图字符串。JEV 使用 `description_en`，新增意图务必补英文描述。
 - `settings.py` / `.env.example`：`INTENT_ROUTER_ENABLED`、`INTENT_*`、`JEV_*`，
   重试相关为 `JEV_MAX_RETRIES`（默认 2）和 `JEV_RETRY_BACKOFF_S`（默认 0.25）。
 - 测试：`tests/test_intent_jev.py`、`tests/test_intent_hybrid.py`、
@@ -461,7 +464,7 @@ bash scripts/verify.sh
 
 当前基线（2026-10-27 接入意图路由后实跑）：
 
-- 全量测试：`191 passed, 1 skipped`（含 3 条领域可插拔契约测试；跳过项为需真实 Milvus 的集成测试）。
+- 全量测试：`196 passed, 1 skipped`（含 3 条领域可插拔 + 5 条意图路由可插拔契约测试；跳过项为需真实 Milvus 的集成测试）。
 - 跳过项：`tests/test_milvus_integration.py`，需要真实 Milvus。
 - 已知无害日志：测试结束时 `milvus_lite` 可能打印
   `ValueError: I/O operation on closed file`，不影响结果。

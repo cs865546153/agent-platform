@@ -1,7 +1,10 @@
 """领域插件基类与共用辅助：减少样板，避免每个领域重写 LangGraph 中断解析。"""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+
+import yaml  # type: ignore[import-untyped]
 
 from agent_core.plugins import AppContext
 
@@ -43,6 +46,31 @@ class DomainPluginBase:
 
     name: str = "unnamed"
     tags: list[str] = []
+    _manifest_cache: Any = None
+
+    @classmethod
+    def _manifest_path(cls) -> Path:
+        """插件目录下的 manifest.yaml；子类可覆盖以自定义位置。"""
+        import inspect
+
+        return Path(inspect.getfile(cls)).resolve().parent / "manifest.yaml"
+
+    def intent_manifest(self) -> Any:
+        """从插件同目录的 ``manifest.yaml`` 加载领域声明，缺失则返回 ``None``。
+
+        结果按类缓存。子类也可直接覆盖本方法返回内存中的 ``DomainManifest``，
+        适合不想落 YAML 的领域。
+        """
+        if self._manifest_cache is None:
+            path = self._manifest_path()
+            if not path.exists():
+                return None
+            # 延迟 import：避免 agent_core.intent <-> agent_core.plugins 循环依赖。
+            from agent_core.intent.contracts import DomainManifest
+
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            self._manifest_cache = DomainManifest.model_validate(raw)
+        return self._manifest_cache
 
     def build_services(self, ctx: AppContext, overrides: dict[str, Any]) -> None:  # noqa: ANN401
         return None

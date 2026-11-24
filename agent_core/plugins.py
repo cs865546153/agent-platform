@@ -6,9 +6,11 @@
 - ``build_services``：按配置装配领域服务（真实后端 / demo 后端）；
 - ``build_graphs``：在 lifespan 中基于 checkpointer 构建 LangGraph；
 - ``register_routes``：注册该领域专属的 HTTP 路由；
+- ``intent_manifest``：声明该领域的意图清单，供意图路由器识别（可选）；
 - ``close``：释放领域持有的资源（可选）。
 
 内核只认识这里定义的协议，不认识理赔、投资或任何具体业务概念。
+领域与意图的事实源随插件走；``configs/domains.yaml`` 仅作未声明插件的回退。
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ class AppContext:
     rag: dict[str, Any] = field(default_factory=dict)
     models: dict[str, Any] = field(default_factory=dict)
     intent_router: Any = None
+    intent_registry: Any = None
 
     @property
     def state(self) -> Any:
@@ -65,6 +68,14 @@ class DomainPlugin(Protocol):
 
     def register_routes(self, ctx: AppContext) -> None:
         """向 ``ctx.application`` 注册该领域的路由。"""
+        ...
+
+    def intent_manifest(self) -> Any:
+        """返回该领域的 ``DomainManifest``；未声明则返回 ``None``。
+
+        可选 hook：内核据此聚合领域清单供 JEV/LLM 意图路由使用，
+        使新增领域无需修改全局 ``configs/domains.yaml``。
+        """
         ...
 
     async def close(self) -> None:

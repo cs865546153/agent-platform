@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -59,6 +60,37 @@ class DomainRegistry:
     @classmethod
     def default(cls) -> "DomainRegistry":
         return cls.from_yaml()
+
+    @classmethod
+    def from_plugins(
+        cls,
+        plugins: Iterable[Any],
+        *,
+        fallback: "DomainRegistry | None" = None,
+    ) -> "DomainRegistry":
+        """从领域插件的 ``intent_manifest()`` 聚合领域清单。
+
+        插件声明优先；未声明意图的插件被跳过。若传了 ``fallback``（通常是
+        ``DomainRegistry.from_yaml()``），则把 fallback 中未被插件覆盖的领域补齐——
+        这样没有对应插件的领域（例如助手图内分流的 general）仍可被意图路由识别。
+
+        插件声明与 fallback 不得同名却内容不同（避免两份事实源悄悄分叉）；
+        若插件未声明某领域而 fallback 有，则以 fallback 为准。
+        """
+        registry = cls()
+        for plugin in plugins:
+            hook = getattr(plugin, "intent_manifest", None)
+            manifest = hook() if callable(hook) else None
+            if manifest is None:
+                continue
+            if manifest.name in registry.names():
+                raise ValueError(f"领域插件重复声明领域：{manifest.name}")
+            registry.register(manifest)
+        if fallback is not None:
+            for name in fallback.names():
+                if name not in registry.names():
+                    registry.register(fallback.get(name))
+        return registry
 
 
 __all__ = ["DEFAULT_CONFIG_PATH", "DomainRegistry"]

@@ -33,8 +33,15 @@ class AssistantRoute:
 class AssistantIntentRouter:
     """把 HybridIntentClassifier 适配到无状态对话图；只做协议转换，不参与业务决策。"""
 
-    def __init__(self, classifier: IntentClassifier) -> None:
+    def __init__(
+        self,
+        classifier: IntentClassifier,
+        *,
+        policy_intents: frozenset[str] = frozenset({"保单查询"}),
+    ) -> None:
         self.classifier = classifier
+        # 允许领域清单声明哪些意图需要兜底抽取保单号；默认兼容旧行为。
+        self.policy_intents = policy_intents
 
     @property
     def engine_label(self) -> str:
@@ -86,14 +93,13 @@ class AssistantIntentRouter:
         name = getattr(item, "file_name", None)
         return str(name or "attachment")[:255]
 
-    @staticmethod
-    def _policy_id(decision: RouteDecision, question: str, turns: list[Turn]) -> str | None:
-        """优先用路由槽位，其次在「保单查询」意图下从当前问题与用户历史中兜底抽取。"""
+    def _policy_id(self, decision: RouteDecision, question: str, turns: list[Turn]) -> str | None:
+        """优先用路由槽位，其次在声明了保单查询的意图下从问题与历史中兜底抽取。"""
         for key in POLICY_SLOT_KEYS:
             value = decision.slots.get(key)
             if value:
                 return str(value)[:64]
-        if decision.intent != "保单查询":
+        if decision.intent not in self.policy_intents:
             return None
         recent_user_text = "\n".join(
             [question, *(turn.content for turn in reversed(turns) if turn.role == "user")]

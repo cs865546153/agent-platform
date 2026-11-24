@@ -1,0 +1,43 @@
+# 投资领域声明：意图清单随插件走。
+name: investment
+description: 投资理财与组合管理：咨询、组合诊断、风险评估、产品查询和交易指令
+description_en: "Investment and portfolio management: advice, portfolio diagnosis, risk assessment, product lookup, and trade instructions"
+version: 0.1.0
+capabilities: [market_data, portfolio, suitability, rag]
+intents:
+  - name: 投资咨询
+    description: 询问投资方向、资产配置思路或理财建议
+    description_en: Ask for investment direction, asset allocation ideas, or wealth management advice
+    examples:
+      - 现在适合买债券基金吗？
+      - 投资基础知识包括哪些内容？
+    risk: medium
+    mode: conversation
+  - name: 组合诊断
+    description: 分析现有持仓、组合收益或配置是否合理
+    description_en: Analyze an existing portfolio, its performance, or whether the allocation is reasonable
+    examples:
+      - 帮我看看我的基金组合怎么调整
+    risk: medium
+    mode: conversation
+  - name: 风险评估
+    description: 评估风险承受能力、风险敞口或适当性
+    description_en: Assess risk tolerance, risk exposure, or suitability
+    examples:
+      - 我的风险承受能力适合什么产品？
+    risk: medium
+    mode: conversation
+  - name: 产品查询
+    description: 查询基金、理财产品或市场产品的信息与历史表现
+    description_en: Look up a fund, wealth product, or market product and its historical performance
+    examples:
+      - 帮我查一下某只基金的历史收益
+    risk: low
+    mode: conversation
+  - name: 交易指令
+    description: 买入、卖出、赎回或转账等会改变持仓的指令
+    description_en: Buy, sell, redeem, or transfer instructions that change holdings
+    examples:
+      - 帮我把基金赎回
+    risk: high
+    mode: case

@@ -44,10 +44,16 @@ from tools.document_analysis import (
 logger = logging.getLogger(__name__)
 
 
-def build_assistant_intent_router(cfg: Settings, intent_model: Any = None) -> Any:
+def build_assistant_intent_router(
+    cfg: Settings,
+    intent_model: Any = None,
+    domain_registry: Any = None,
+) -> Any:
     """按配置构建主链路意图路由；失败时返回 None，由内置 LLM 分类兜底。
 
     - 路由层只决定 domain/intent/confidence，业务分流仍由对话图负责。
+    - ``domain_registry`` 是领域/意图清单；不传时从 ``configs/domains.yaml`` 加载。
+      内核装配时由 ``create_app`` 从已启用的领域插件聚合后传入。
     - 缺少 JEV_API_KEY 时 factory 会跳过 JEV 影子；INTENT_ENGINE=jev 则会因缺 key
       初始化失败，这里降级为内置分类而不是让服务启动失败。
     """
@@ -74,10 +80,23 @@ def build_assistant_intent_router(cfg: Settings, intent_model: Any = None) -> An
         config = IntentConfig.from_settings(cfg)
         classifier = build_intent_classifier(
             config,
+            registry=domain_registry,
             llm_model=intent_model or get_model('classification'),
             on_decision=log_decision,
         )
-        router = AssistantIntentRouter(classifier)
+        # 保单号兜底抽取的触发意图从领域清单派生，不再写死"保单查询"。
+        policy_intents: set[str] = set()
+        if domain_registry is not None:
+            for domain in domain_registry.all():
+                if 'policy_query' in (getattr(domain, 'capabilities', None) or ()):
+                    # 只取语义上确实是保单查询的意图，避免把同领域其他意图也算进来。
+                    policy_intents.update(
+                        spec.name for spec in domain.intents if '保单' in spec.name
+                    )
+        router = AssistantIntentRouter(
+            classifier,
+            policy_intents=frozenset(policy_intents) if policy_intents else frozenset({'保单查询'}),
+        )
         logger.info('意图路由已启用：%s（INTENT_ENGINE=%s）', router.engine_label, cfg.intent_engine)
         return router
     except Exception as exc:  # noqa: BLE001 - 路由初始化失败不能阻断服务启动
@@ -104,11 +123,17 @@ def create_app(
     knowledge_rag: Any = None,
     knowledge_model: Any = None,
     registry: PluginRegistry | None = None,
+    intent_router: Any = None,
+    intent_domain_registry: Any = None,
 ) -> FastAPI:
     """装配应用。
 
     ``registry`` 是模板的核心扩展点：传入自定义领域插件集即可增删业务域，
     内核（本文件）无需改动。默认装配 ``domains/registry.py`` 登记的示例领域。
+
+    意图路由同样可插拔：``intent_router`` 显式传入时跳过内核构建（测试/自定义引擎）；
+    否则 ``intent_domain_registry`` 决定领域清单，未传时从已启用插件的
+    ``intent_manifest()`` 聚合（YAML 回退补齐无插件的领域，如 general）。
     """
     cfg = Settings()
     registry = registry or default_registry()
@@ -146,7 +171,24 @@ def create_app(
             logger.exception('通用知识库初始化失败，已关闭 /api/rag')
     ctx.rag['investment'] = effective_investment_rag
     ctx.rag['knowledge'] = effective_knowledge_rag
-    effective_intent_router = build_assistant_intent_router(cfg, intent_model)
+
+    # 意图路由可插拔：显式注入 > 自定义领域清单 > 从插件聚合（YAML 回退）。
+    if intent_domain_registry is None:
+        from agent_core.intent.registry import DomainRegistry
+
+        intent_domain_registry = DomainRegistry.from_plugins(
+            registry.all(), fallback=DomainRegistry.default()
+        )
+    ctx.intent_registry = intent_domain_registry
+    if intent_router is None:
+        effective_intent_router = build_assistant_intent_router(
+            cfg, intent_model, domain_registry=intent_domain_registry
+        )
+        owns_intent_router = True
+    else:
+        effective_intent_router = intent_router
+        owns_intent_router = False
+    ctx.intent_router = effective_intent_router
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -164,6 +206,12 @@ def create_app(
         audit = AuditStore(audit_path)
         application.state.audit = audit
         application.state.intent_router = effective_intent_router
+        application.state.intent_registry = intent_domain_registry
+        # 图内分支策略从领域清单派生；未声明领域时 IntentRoutingPolicy 用默认兼容值。
+        from agents.assistant_agent import IntentRoutingPolicy
+        application.state.intent_routing_policy = IntentRoutingPolicy.from_registry(
+            intent_domain_registry
+        )
         try:
             async with AsyncSqliteSaver.from_conn_string(path) as saver:
                 await saver.setup()
@@ -175,7 +223,8 @@ def create_app(
                 application.state.investment_graph = ctx.graphs.get('investment')
                 yield
         finally:
-            if effective_intent_router is not None:
+            # 只关闭内核自建的 router；外部注入的由调用方负责生命周期。
+            if owns_intent_router and effective_intent_router is not None:
                 try:
                     await effective_intent_router.aclose()
                 except Exception:  # noqa: BLE001 - 关闭失败不影响进程退出
@@ -475,6 +524,7 @@ def create_app(
                     service=service,
                     investment_rag=effective_investment_rag,
                     intent_router=getattr(application.state, 'intent_router', None),
+                    routing_policy=getattr(application.state, 'intent_routing_policy', None),
                 )
                 state = await graph.ainvoke({
                     'question': body.question,
