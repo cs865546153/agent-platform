@@ -1,7 +1,7 @@
 # AGENTS.md
 
 本文件是项目级的 Agent 工作说明。根目录使用 `AGENTS.md`（复数、全大写）是通用约定；
-`My_Study/Agent 相关.md` 等学习笔记不作为执行规范。
+个人学习笔记已归档至工作区根目录 `../teaching-archive/`，不作为执行规范。
 
 最后全量扫描：2026-10-26。
 
@@ -39,7 +39,7 @@ FastAPI
 扫描时本机 `.env` 使用 `MODEL_PROVIDER=deepseek`（非密钥，随环境调整）；
 不要把 `.env` 中的密钥写进文档、日志或提交。
 
-`My_Study/` 是个人学习目录，不属于本项目实现；不要把它当作规范或测试对象。
+个人学习目录已迁至工作区根目录 `../teaching-archive/My_Study/`，不属于本项目实现；不要把它当作规范或测试对象。
 
 ## 目录
 
@@ -66,7 +66,18 @@ tools/                  业务工具、RAG、Milvus、rerank、文档解析
   vector_store.py       Milvus 集合与可达性检查
   document_analysis.py  附件校验、文本抽取、多模态单证识别
 adapters/               真实业务适配器（HTTP + 熔断 + 降级）与 demo 后端
-agent_core/intent/      意图路由公共层：JEV / LLM / Hybrid / Registry / adapter（主链路接入点）
+agent_core/             领域无关内核
+  plugins.py            DomainPlugin 协议、AppContext、PluginRegistry（模板扩展点）
+  security.py           API Key / 审核员认证、生产密钥校验
+  sse.py                SSE 帧编码
+  intent/               意图路由公共层：JEV / LLM / Hybrid / Registry / adapter
+domains/                领域插件（可增删，新增领域不改内核）
+  registry.py           默认领域登记表（唯一"启用哪些领域"的事实源）
+  base.py               插件基类 + LangGraph 中断/配置共用辅助
+  claims/               示例域：理赔服务装配、图、核心路由
+  investment/           示例域：投资服务装配、图、核心路由
+  example/              最小示例：演示新领域如何接入
+TEMPLATE.md             模板定位、内核/领域边界、新增领域三步指南
 configs/domains.yaml    领域与意图单一事实源（含 description_en）
 data/investment_wiki/   投资 Wiki 源文件（约 55 chunks）
 data/knowledge_base/    通用知识库源文件（当前约 3 chunks）
@@ -450,7 +461,7 @@ bash scripts/verify.sh
 
 当前基线（2026-10-27 接入意图路由后实跑）：
 
-- 全量测试：`188 passed, 1 skipped`，约 6.4s（含 JEV 429/5xx 重试用例）。
+- 全量测试：`191 passed, 1 skipped`（含 3 条领域可插拔契约测试；跳过项为需真实 Milvus 的集成测试）。
 - 跳过项：`tests/test_milvus_integration.py`，需要真实 Milvus。
 - 已知无害日志：测试结束时 `milvus_lite` 可能打印
   `ValueError: I/O operation on closed file`，不影响结果。
@@ -524,7 +535,7 @@ bash scripts/verify.sh
 | `docs/investment-rag.md` | 投资 Wiki、索引构建、降级策略 |
 | `docs/platform-architecture-workflow.md` | 平台架构、意图路由、演进方向 |
 | `docs/structured-output.md` | 结构化输出选型与迁移 |
-| `docs/implementation-matrix.md` | 培训材料逐项实现追踪 |
+| `TEMPLATE.md` | 模板定位、内核/领域边界、新增领域指南 |
 | `deploy/runbook.md` | 发布、回退与运维 |
 | `demos/完整链路图.md` | 端到端链路 Mermaid |
 | `demos/理赔Agent端到端状态机图.md` | 理赔状态机 Mermaid |

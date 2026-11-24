@@ -13,43 +13,25 @@ from fastapi import Depends, FastAPI, File, Header, HTTPException, Response, Upl
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel
 
-from adapters.business import BusinessBackend, DemoBackend
-from adapters.investment import DemoInvestmentBackend, InvestmentBackend
+from agent_core.plugins import AppContext, PluginRegistry
+from agent_core.security import validate_production_keys
+from domains.registry import default_registry
 from agents.audit_store import AuditStore
 from agents.http_middleware import EnterpriseHttpMiddleware
 from agents.claim_agent import WorkflowServices, build_claim_graph
-from agents.investment_agent import (
-    InvestmentServices,
-    build_demo_trace,
-    build_investment_graph,
-    investment_advice_from_state,
-    investment_initial_state,
-    investment_state_to_response,
-    run_demo_investment,
-)
+from agents.investment_agent import InvestmentServices
 from agents.middleware_audit import configure_logging, mask_pii, RateLimitMiddleware
-from agents.observability import tracing_config
 from config import ClaimLLMFactory, get_model
-from models.investment import (
-    DemoInvestmentRunResponse,
-    InvestmentConfirmation,
-    InvestmentRAGQuery,
-    InvestmentRAGResponse,
-    InvestmentRequest,
-    InvestmentResponse,
-    InvestmentReviewInput,
-)
 from models.knowledge import (
     KnowledgeAnswerResponse,
     KnowledgeRAGQuery,
     KnowledgeSearchResponse,
 )
-from models.schemas import ClaimRequest, ClaimResponse
+from models.schemas import ClaimResponse
 from models.workbench import AssistantRequest, DemoClaimRunResponse, DocumentBatchResponse
-from monitoring import metrics, REQUESTS, ERRORS, LATENCY, CONFIDENCE, ITERATIONS, TOKENS
+from monitoring import metrics, ERRORS
 from settings import Settings
 from tools.document_analysis import (
     MAX_DOCUMENT_BYTES,
@@ -107,19 +89,6 @@ class HealthResponse(BaseModel):
     status: Literal['ok'] = 'ok'
 
 
-class Supplement(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    policy_id: str = Field(min_length=1, max_length=64)
-
-
-class ReviewInput(BaseModel):
-    model_config = ConfigDict(extra='forbid')
-    decision: Literal['review', 'accept', 'reject']
-    reviewer: str = Field(min_length=1, max_length=64)
-    reason: str = Field(min_length=1, max_length=1000)
-    clause_basis: list[str] = Field(default_factory=list)
-
-
 def create_app(
     services: WorkflowServices | None = None,
     *,
@@ -134,19 +103,33 @@ def create_app(
     investment_rag: Any = None,
     knowledge_rag: Any = None,
     knowledge_model: Any = None,
+    registry: PluginRegistry | None = None,
 ) -> FastAPI:
+    """装配应用。
+
+    ``registry`` 是模板的核心扩展点：传入自定义领域插件集即可增删业务域，
+    内核（本文件）无需改动。默认装配 ``domains/registry.py`` 登记的示例领域。
+    """
     cfg = Settings()
-    if cfg.business_mode == 'demo':
-        from tools.policy_store import ensure_policy_store
-        from tools.demo_clauses import build_demo_clause_retriever
-        backend = DemoBackend(policy_store=ensure_policy_store())
-        service = services or WorkflowServices(backend, clause_retriever=build_demo_clause_retriever())
-    else:
-        backend = BusinessBackend()
-        service = services or WorkflowServices(backend)
-    investment_service = investment_services or InvestmentServices(
-        DemoInvestmentBackend() if cfg.business_mode == 'demo' else InvestmentBackend()
+    registry = registry or default_registry()
+    overrides: dict[str, Any] = {
+        'services': services,
+        'investment_services': investment_services,
+    }
+    limiter = RateLimitMiddleware()
+    locks: dict[str, asyncio.Lock] = {}
+    # 内核只持有 AppContext；具体服务/图由领域插件装配，路由从 ctx 按需取用。
+    ctx = AppContext(
+        application=None,  # type: ignore[arg-type]  # application 在下方创建后回填
+        settings=cfg,
+        static_dir=Path(__file__).resolve().parent / 'static',
+        limiter=limiter,
+        locks=locks,
     )
+    for plugin in registry.all():
+        plugin.build_services(ctx, overrides)
+    service: WorkflowServices | None = ctx.services.get('claims')
+
     effective_investment_rag = investment_rag
     if effective_investment_rag is None and cfg.investment_rag_enabled:
         try:
@@ -161,8 +144,8 @@ def create_app(
             effective_knowledge_rag = get_knowledge_rag()
         except Exception:  # noqa: BLE001 - 通用知识库损坏不应阻断既有业务
             logger.exception('通用知识库初始化失败，已关闭 /api/rag')
-    limiter = RateLimitMiddleware()
-    locks: dict[str, asyncio.Lock] = {}
+    ctx.rag['investment'] = effective_investment_rag
+    ctx.rag['knowledge'] = effective_knowledge_rag
     effective_intent_router = build_assistant_intent_router(cfg, intent_model)
 
     @asynccontextmanager
@@ -170,17 +153,9 @@ def create_app(
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
         # 先配置日志，后续启动校验与业务日志才不会被默认级别丢弃。
         configure_logging()
-        if os.getenv('APP_ENV') == 'production':
-            claims_key = os.getenv('CLAIMS_API_KEY', '')
-            reviewer_key = os.getenv('REVIEWER_API_KEY', '')
-            if not claims_key or not reviewer_key:
-                raise RuntimeError('生产环境必须配置CLAIMS_API_KEY和REVIEWER_API_KEY')
-            weak = {'changeme', 'secret', 'password', 'test', 'dev', 'admin', '123456'}
-            for name, value in (('CLAIMS_API_KEY', claims_key), ('REVIEWER_API_KEY', reviewer_key)):
-                if len(value) < 16 or value.lower() in weak:
-                    raise RuntimeError(f'生产环境 {name} 过弱：至少 16 位且不能是常见口令')
-            if Path('.env').exists():
-                logger.warning('生产环境检测到 .env 文件：请改用环境变量或密钥管理（Vault/KMS）注入')
+        validate_production_keys()
+        if os.getenv('APP_ENV') == 'production' and Path('.env').exists():
+            logger.warning('生产环境检测到 .env 文件：请改用环境变量或密钥管理（Vault/KMS）注入')
         path = database or os.getenv('CLAIMS_CHECKPOINT_DB') or '.data/checkpoints.sqlite'
         if path != ':memory:':
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -192,8 +167,12 @@ def create_app(
         try:
             async with AsyncSqliteSaver.from_conn_string(path) as saver:
                 await saver.setup()
-                application.state.graph = build_claim_graph(service, saver)
-                application.state.investment_graph = build_investment_graph(investment_service, saver)
+                for plugin in registry.all():
+                    plugin.build_graphs(ctx, saver)
+                # 兼容层：既有 demo/workbench 路由通过 application.state.* 访问图。
+                # 自定义 registry 未装配某领域时置 None，路由按需报错而非启动失败。
+                application.state.graph = ctx.graphs.get('claims')
+                application.state.investment_graph = ctx.graphs.get('investment')
                 yield
         finally:
             if effective_intent_router is not None:
@@ -212,6 +191,11 @@ def create_app(
     static_dir = Path(__file__).resolve().parent / 'static'
     application.mount('/static', StaticFiles(directory=static_dir), name='static')
 
+    # 回填内核上下文并让领域插件注册各自路由（内核不再硬编码业务路由）。
+    ctx.application = application
+    for plugin in registry.all():
+        plugin.register_routes(ctx)
+
     def authenticate(x_api_key: str = Header(default='')) -> None:
         expected = os.getenv('CLAIMS_API_KEY', '')
         if os.getenv('APP_ENV') == 'production' and not expected:
@@ -225,85 +209,6 @@ def create_app(
             raise HTTPException(503, '尚未配置审核员认证')
         if not hmac.compare_digest(x_reviewer_key, expected):
             raise HTTPException(403, '需要授权审核员')
-
-    def graph_config(claim_id: str) -> dict[str, Any]:
-        return {'configurable': {'thread_id': claim_id}}
-
-    def investment_graph_config(request_id: str) -> dict[str, Any]:
-        return {'configurable': {'thread_id': f'investment:{request_id}'}, 'recursion_limit': 30}
-
-    def interrupt_value(snapshot: Any) -> dict[str, Any] | None:
-        """兼容 StateSnapshot 与 ainvoke 返回值中的 interrupt 表达。"""
-        if isinstance(snapshot, dict):
-            for item in snapshot.get('__interrupt__') or ():
-                value = getattr(item, 'value', item)
-                if isinstance(value, dict):
-                    return value
-        for task in getattr(snapshot, 'tasks', ()) or ():
-            for item in getattr(task, 'interrupts', ()) or ():
-                value = getattr(item, 'value', None)
-                if isinstance(value, dict):
-                    return value
-        return None
-
-    def interrupt_kind(snapshot: Any) -> str | None:
-        value = interrupt_value(snapshot)
-        return str(value.get('kind')) if value else None
-
-    def investment_request_from_state(state: dict[str, Any]) -> InvestmentRequest:
-        return InvestmentRequest(
-            request_id=state['request_id'],
-            question=state.get('question') or '投资请求',
-            intent=state.get('intent') or '投资咨询',
-            risk_profile=state.get('risk_profile'),
-            portfolio_id=state.get('portfolio_id'),
-            product_id=state.get('product_id'),
-            amount=state.get('amount'),
-            confirmed=bool(state.get('confirmed')),
-        )
-
-    async def status(claim_id: str) -> ClaimResponse:
-        snapshot = await application.state.graph.aget_state(graph_config(claim_id))
-        state = snapshot.values
-        if not state:
-            raise HTTPException(404, '未找到案件')
-        pending = snapshot.next
-        phase = 'awaiting_information' if 'intake' in pending else 'awaiting_review' if 'review' in pending else state.get('phase', 'pending')
-        return ClaimResponse(claim_id=claim_id,
-            decision='pending' if phase == 'awaiting_information' else 'review' if phase == 'awaiting_review' else state.get('decision', 'pending'),
-            phase=phase, confidence=state.get('confidence'), demo=getattr(service.backend, 'demo', False),
-            message=mask_pii(state.get('message') or ('需要补充保单编号' if phase == 'awaiting_information' else '等待人工审核')))
-
-    async def invoke(claim_id: str, payload: Any) -> ClaimResponse:
-        config, handler = tracing_config(claim_id, cfg)
-        start = time.monotonic()
-        try:
-            limiter.check(claim_id)
-            await application.state.graph.ainvoke(payload, config=config)
-            result = await status(claim_id)
-            REQUESTS.labels(result.decision).inc()
-            if result.confidence is not None:
-                CONFIDENCE.observe(result.confidence)
-            snapshot = await application.state.graph.aget_state(graph_config(claim_id))
-            ITERATIONS.observe(len(snapshot.values.get('expert_results', [])) + snapshot.values.get('rounds', 0))
-            usage = config['callbacks'][0].snapshot()
-            TOKENS.labels('input').inc(usage['prompt_tokens'])
-            TOKENS.labels('output').inc(usage['completion_tokens'])
-            return result
-        except HTTPException:
-            raise
-        except ValueError as exc:
-            ERRORS.labels('validation').inc()
-            raise HTTPException(422, '审核输入或模型结果不符合契约') from exc
-        except Exception as exc:
-            ERRORS.labels(type(exc).__name__).inc()
-            if str(exc) == 'rate_limit_exceeded':
-                raise HTTPException(429, '该案件请求过于频繁') from exc
-            raise HTTPException(503, '处理链路暂不可用，请查询案件状态或转人工') from exc
-        finally:
-            LATENCY.observe(time.monotonic() - start)
-            if handler is not None:
-                await asyncio.to_thread(handler.flush)
 
     @application.get('/health', response_model=HealthResponse, tags=['健康检查'])
     async def health() -> HealthResponse:
@@ -444,28 +349,6 @@ def create_app(
         )
         return DemoClaimRunResponse(claim=claim, documents=documents, result=result, trace=trace)
 
-    @application.post('/api/demo/investment/process', response_model=DemoInvestmentRunResponse, tags=['本地演示'])
-    async def process_demo_investment() -> DemoInvestmentRunResponse:
-        """使用固定合成组合运行投资域图，不连接券商、不执行真实下单。"""
-        if cfg.app_env == 'production':
-            raise HTTPException(404, '演示接口在生产环境不可用')
-        request, state, result = await run_demo_investment()
-        return DemoInvestmentRunResponse(
-            request=request,
-            result=result,
-            advice=investment_advice_from_state(state),
-            trace=build_demo_trace(state, request),
-        )
-
-    @application.post('/api/investment/rag/search', response_model=InvestmentRAGResponse,
-                      dependencies=[Depends(authenticate)], tags=['投资域'])
-    async def search_investment_rag(body: InvestmentRAGQuery) -> InvestmentRAGResponse:
-        """只读检索投资知识库；返回引用，不生成交易建议。"""
-        if effective_investment_rag is None:
-            raise HTTPException(503, '投资知识库未启用')
-        result = await asyncio.to_thread(effective_investment_rag, body.question, body.top_k)
-        return InvestmentRAGResponse(**result)
-
     @application.get('/api/rag/domains', dependencies=[Depends(authenticate)], tags=['RAG'])
     async def list_rag_domains() -> dict[str, Any]:
         """列出已配置的知识库 domain；不触发向量库连接。"""
@@ -519,99 +402,6 @@ def create_app(
         except KnowledgeAnswerError as exc:
             raise HTTPException(502, str(exc)) from exc
         return KnowledgeAnswerResponse(**result)
-
-    @application.post('/api/investment/process', response_model=InvestmentResponse,
-                      dependencies=[Depends(authenticate)], tags=['投资域'])
-    async def process_investment(request: InvestmentRequest) -> InvestmentResponse:
-        """投资咨询直接形成建议；交易指令在二次确认前暂停，不执行下单。"""
-        async with locks.setdefault(f'investment:{request.request_id}', asyncio.Lock()):
-            config = investment_graph_config(request.request_id)
-            snapshot = await application.state.investment_graph.aget_state(config)
-            if snapshot.values:
-                return investment_state_to_response(
-                    snapshot.values, request, interrupted=interrupt_kind(snapshot)
-                )
-            state = await application.state.investment_graph.ainvoke(
-                investment_initial_state(request), config=config
-            )
-            return investment_state_to_response(
-                state, request, interrupted=interrupt_kind(state)
-            )
-
-    @application.post('/api/investment/{request_id}/confirm', response_model=InvestmentResponse,
-                      dependencies=[Depends(authenticate)], tags=['投资域'])
-    async def confirm_investment(request_id: str, body: InvestmentConfirmation) -> InvestmentResponse:
-        """二次确认交易指令；确认后进入人工审批，仍未下单。"""
-        async with locks.setdefault(f'investment:{request_id}', asyncio.Lock()):
-            config = investment_graph_config(request_id)
-            snapshot = await application.state.investment_graph.aget_state(config)
-            if not snapshot.values:
-                raise HTTPException(404, '未找到投资请求')
-            request = investment_request_from_state(snapshot.values)
-            if interrupt_kind(snapshot) != 'trade_confirmation':
-                raise HTTPException(409, '当前请求不处于交易二次确认阶段')
-            state = await application.state.investment_graph.ainvoke(
-                Command(resume=body.model_dump()), config=config
-            )
-            return investment_state_to_response(
-                state, request, interrupted=interrupt_kind(state)
-            )
-
-    @application.post('/api/investment/{request_id}/review', response_model=InvestmentResponse,
-                      dependencies=[Depends(authenticate), Depends(authenticate_reviewer)], tags=['投资域'])
-    async def review_investment(request_id: str, body: InvestmentReviewInput) -> InvestmentResponse:
-        """人工审批交易指令；只有 approve 且适配器实际执行时才标记 executed。"""
-        if body.decision == 'reject' and not body.reason:
-            raise HTTPException(422, '拒绝交易必须记录理由')
-        async with locks.setdefault(f'investment:{request_id}', asyncio.Lock()):
-            config = investment_graph_config(request_id)
-            snapshot = await application.state.investment_graph.aget_state(config)
-            if not snapshot.values:
-                raise HTTPException(404, '未找到投资请求')
-            request = investment_request_from_state(snapshot.values)
-            if interrupt_kind(snapshot) != 'investment_review':
-                raise HTTPException(409, '当前请求不处于人工审批阶段')
-            state = await application.state.investment_graph.ainvoke(
-                Command(resume=mask_pii(body.model_dump())), config=config
-            )
-            return investment_state_to_response(
-                state, request, interrupted=interrupt_kind(state)
-            )
-
-    @application.post('/api/claims/process', response_model=ClaimResponse, dependencies=[Depends(authenticate)])
-    async def process_claim(request: ClaimRequest) -> ClaimResponse:
-        async with locks.setdefault(request.claim_id, asyncio.Lock()):
-            existing = await application.state.graph.aget_state(graph_config(request.claim_id))
-            if existing.values:
-                # 同案号不同内容不能悄悄覆盖检查点。
-                if existing.values['claim_data'] != mask_pii(request.model_dump(mode='json')):
-                    raise HTTPException(409, '案件已存在；请使用补材料或审核接口')
-                return await status(request.claim_id)
-            return await invoke(request.claim_id, {'claim_id': request.claim_id,
-                'claim_data': mask_pii(request.model_dump(mode='json')), 'rounds': 0, 'expert_results': []})
-
-    @application.get('/api/claims/{claim_id}', response_model=ClaimResponse, dependencies=[Depends(authenticate)])
-    async def get_claim(claim_id: str) -> ClaimResponse:
-        return await status(claim_id)
-
-    @application.post('/api/claims/{claim_id}/supplement', response_model=ClaimResponse, dependencies=[Depends(authenticate)])
-    async def supplement(claim_id: str, body: Supplement) -> ClaimResponse:
-        async with locks.setdefault(claim_id, asyncio.Lock()):
-            current = await status(claim_id)
-            if current.phase != 'awaiting_information':
-                raise HTTPException(409, '当前案件不处于补材料阶段')
-            return await invoke(claim_id, Command(resume=body.model_dump()))
-
-    @application.post('/api/claims/{claim_id}/review', response_model=ClaimResponse,
-                      dependencies=[Depends(authenticate), Depends(authenticate_reviewer)])
-    async def review(claim_id: str, body: ReviewInput) -> ClaimResponse:
-        if body.decision == 'reject' and not body.clause_basis:
-            raise HTTPException(422, '拒赔必须提供核实后的条款依据')
-        async with locks.setdefault(claim_id, asyncio.Lock()):
-            current = await status(claim_id)
-            if current.phase != 'awaiting_review':
-                raise HTTPException(409, '当前案件不处于人工审核阶段')
-            return await invoke(claim_id, Command(resume=mask_pii(body.model_dump())))
 
     @application.post('/api/documents/analyze', response_model=DocumentBatchResponse,
                       dependencies=[Depends(authenticate)], tags=['工作台'])

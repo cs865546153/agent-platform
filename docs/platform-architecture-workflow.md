@@ -1,13 +1,19 @@
 #  AI Agent 平台：架构与工作流
 
-> 版本：v0.2  
-> 适用范围：当前仓库的理赔对话、理赔案件，以及规划中的投资 / 通用领域。  
+> 版本：v0.3（2026-11-24 模板化重构）  
+> 适用范围：当前仓库的理赔对话、理赔案件、投资领域，以及通用的知识库问答。
+> 本项目已按企业级 Agent 模板组织：内核（`app.py` / `agent_core/`）与领域（`domains/`）解耦，
+> 扩展方法见根目录 [TEMPLATE.md](../TEMPLATE.md)，系统实际结构见 [Architecture.md](../Architecture.md)。  
 > 标记说明：`[现有]` 表示当前代码已有；`[新增]` 表示已落地；`[已接入]` 表示已接进主链路；
 > `[规划]` 表示设计已定，尚未接入。
 >
 > 2026-10-27：`IntentRouter` 已接入 `/api/assistant/stream`；代码默认 `shadow`，当前 `.env`
 > 为 `hybrid`（JEV 主 + LLM 兜底）；JEV 单引擎评测联合准确率 89.7%（39 条）。
 > 代码路径为 `agent_core/intent/`，本文历史段落中的 `platform/intent/` 为旧名。
+>
+> 2026-11-24：业务路由已迁入 `domains/<域>/routes.py`，由 `PluginRegistry` 装配；
+> 默认启用 claims / investment 两个领域，`example` 是最小接入骨架（按需注入，默认不启用）。
+> 通用问答走助手图内分流，不是独立领域插件——本文历史段落中的 `GeneralPlugin` 均指该分流。
 
 
 ---
@@ -20,7 +26,7 @@
 |---|---|
 | 前台 | FastAPI 接入层 |
 | 分诊台 | `IntentRouter` 意图路由 |
-| 科室 | `DomainPlugin`：claims / investment / general |
+| 科室 | `DomainPlugin`：claims / investment / example（示例）；通用问答走助手图内分流 |
 | 医生问诊、检查 | LangGraph 图执行 |
 | 化验、影像、会诊 | RAG、三专家并行、工具调用 |
 | 主任复核 | HITL 人工审核 |
@@ -46,9 +52,9 @@
                                 ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │ 1. 接入层 [现有]                                                   │
-│    FastAPI app.py                                                  │
-│    ├─ /api/assistant/stream   对话流式入口                         │
-│    ├─ /api/claims/*           理赔案件接口                         │
+│    FastAPI app.py（内核装配；create_app(registry=)）              │
+│    ├─ 内核路由：/api/assistant/stream · /api/rag/* · /api/documents/analyze │
+│    ├─ 插件路由：/api/claims/* · /api/investment/*（ domains/*/routes.py ） │
 │    └─ SSE / JSON                                                  │
 └───────────────────────────────┬────────────────────────────────────┘
                                 ▼
@@ -75,13 +81,15 @@
 └───────────────────────────────┬────────────────────────────────────┘
                                 ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│ 5. 领域插件 [部分现有 / 部分规划]                                  │
+│ 5. 领域插件 [已落地：内核 + 插件机制]                              │
 │                                                                    │
-│  ClaimsPlugin          InvestmentPlugin        GeneralPlugin       │
-│  ├─ 理赔对话图          ├─ 组合诊断图           └─ 一般问答图       │
-│  ├─ 理赔案件状态机      ├─ 风险评估图                               │
-│  ├─ 三专家并行          ├─ 产品查询图                               │
-│  └─ RAG + HITL          └─ 交易指令图 + HITL                        │
+│  ClaimsPlugin [默认]   InvestmentPlugin [默认]  ExamplePlugin [按需]│
+│  ├─ 理赔案件状态机      ├─ 投资咨询图           └─ /api/example/echo │
+│  ├─ 三专家并行          ├─ 交易二次确认 + HITL      （最小接入骨架） │
+│  └─ RAG + HITL          └─ 人工审批                                 │
+│                                                                    │
+│  通用问答：助手图内分流（非独立插件）                              │
+│  装配入口：domains/registry.py 的 default_registry()（默认装前两个）│
 └───────────────────────────────┬────────────────────────────────────┘
                                 ▼
 ┌────────────────────────────────────────────────────────────────────┐
@@ -142,12 +150,14 @@
                            │
           ┌────────────────┼────────────────┐
           ▼                ▼                ▼
-     ClaimsPlugin    InvestmentPlugin   GeneralPlugin
+     ClaimsPlugin    InvestmentPlugin   ExamplePlugin
           │                │                │
           ▼                ▼                ▼
-   理赔对话/案件图    投资组合/风险图     一般问答图
+   理赔案件状态机    投资图 + HITL        最小示例路由
           │                │                │
           └────────────────┼────────────────┘
+                           │
+                  （一般问答走助手图内分流，非独立插件）
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ 6. 图执行 LangGraph                                           │
@@ -196,13 +206,13 @@ RouteDecision ──判断──┤
 4. 组装 IntentRequest：
       message / history / active_domain / attachments
 5. IntentRouter 判断：
-      domain     = claims / investment / general
+      domain     = claims / investment / general（general 为助手图内分流）
       intent     = 领域内具体意图
       confidence / margin
-6. DomainRegistry 校验 domain + intent 是否合法
-7. 选择 DomainPlugin：
-      低风险 → 对话图
-      高风险 → 案件图
+6. DomainRegistry 校验 domain + intent 是否合法（configs/domains.yaml）
+7. 选择执行路径：
+      /api/claims/* → ClaimsPlugin 案件状态机；/api/investment/* → InvestmentPlugin；
+      /api/assistant/stream → 助手图按意图分流（低风险对话图，高风险案件图）
 8. LangGraph 执行节点：
       分类 / 材料门禁 / 查询 / RAG / 三专家并行
 9. 高风险节点触发 HITL：
@@ -428,12 +438,13 @@ INTENT_MARGIN_THRESHOLD=0.2
 | `agent_core/intent/hybrid.py` | `[新增]` 已落地：主路由 + 兜底 + 影子 |
 | `agent_core/intent/factory.py` | `[新增]` 已落地：`shadow / hybrid / jev / llm` 四种预设 |
 | `agent_core/intent/adapter.py` | `[已接入]` 已落地：`AssistantIntentRouter` 把路由决策转成工作台 `IntentResult` |
-| `configs/domains.yaml` | `[新增]` 已落地：claims / investment / general 三领域清单 |
+| `configs/domains.yaml` | `[新增]` 已落地：claims / investment / general 领域与意图清单（general 为助手图内分流） |
 | `scripts/eval_intent.py` | `[新增]` 已落地：准确率、混淆矩阵、兜底率、影子一致性、延迟 |
 | `data/intent_golden.jsonl` | `[新增]` 已落地：中英混合合成评测集 |
 | `app.py` 接入 IntentRouter | `[已接入]` `build_assistant_intent_router()` + `/api/assistant/stream`；可用 `INTENT_ROUTER_ENABLED=false` 关闭 |
-| `ClaimsPlugin` 包装 | `[规划]` 待做：当前仍由 `assistant_agent` 直接分流 |
-| `Investment / General` 图实现 | `[规划]` 待做 |
+| `ClaimsPlugin` 包装 | `[已接入]` `domains/claims/`：服务装配 + 理赔状态机 + `/api/claims/*` 路由 |
+| `InvestmentPlugin` 包装 | `[已接入]` `domains/investment/`：投资图 + 二次确认/HITL + `/api/investment/*` 路由 |
+| `ExamplePlugin` 最小示例 | `[已接入]` `domains/example/`：展示新领域接入骨架 |
 | Redis / Celery / Kafka 等外部适配器 | `[规划]` 待做 |
 | Outbox 闭环 | `[规划]` 当前未闭环 |
 
@@ -441,9 +452,9 @@ INTENT_MARGIN_THRESHOLD=0.2
 
 | 环节 | 当前 | 目标 |
 |---|---|---|
-| 入口 | `/assistant/stream` + `/claims/*` | 统一入口 + 领域路由 |
+| 入口 | 内核通用路由 + `PluginRegistry` 装配的领域路由 | 保持（已达成插件化） |
 | 意图识别 | `IntentRouter` 已接入，失败回落内置分类 | 领域插件各自持有图 |
-| 领域 | 理赔 + 投资 + 通用（图内分流） | claims / investment / general 插件化 |
+| 领域 | claims / investment / example 插件化；通用问答走助手图内分流 | 按业务需要增删领域插件 |
 | 状态 | 进程内 checkpointer | `StateStore` SPI（Redis/Postgres） |
 | 队列 | 同步长请求 | `TaskQueue`（Celery/Arq） |
 | 事件 | Outbox 未闭环 | `EventBus` / Outbox |
@@ -457,14 +468,15 @@ INTENT_MARGIN_THRESHOLD=0.2
 ### 8.1 新增一个领域
 
 ```text
-1. 在 configs/domains.yaml 增加领域清单
-2. 实现一个 DomainPlugin：
-     manifest + graph + capabilities
-3. 注册 entry point / 配置
-4. 增加领域一致性测试
+1. 以 domains/example/ 为骨架实现 DomainPlugin：
+     build_services（依赖装配）+ build_graphs（可选）+ register_routes（领域路由）
+     依赖全部从 AppContext 取，不 import app.py
+2. 在 domains/registry.py 的 default_registry() 登记插件（唯一启用开关）
+3. 在 configs/domains.yaml 登记领域与意图（description_en 供英文优先的 JEV 使用）
+4. 用 create_app(registry=PluginRegistry([MyPlugin()])) 写可插拔契约测试
 ```
 
-目标是：**内核不改，只加插件。**
+目标是：**内核不改，只加插件。** 逐步操作见 [TEMPLATE.md](../TEMPLATE.md) 第 3 节。
 
 ### 8.2 新增一种意图引擎
 
@@ -538,7 +550,7 @@ python -m scripts.eval_intent --engine jev --translate
 
 | 术语 | 含义 |
 |---|---|
-| Domain | 业务领域，如 claims / investment / general |
+| Domain | 业务领域，如 claims / investment（general 为助手图内分流，非独立插件） |
 | Intent | 领域内具体意图，如“理赔报案”“组合诊断” |
 | IntentRouter | 统一意图路由，输出 domain + intent |
 | RouteDecision | 路由结果，含置信度、margin、是否澄清 |
@@ -590,7 +602,7 @@ IntentRouter：domain + intent + confidence
   ↓
 DomainRegistry：校验领域与意图
   ↓
-DomainPlugin：claims / investment / general
+PluginRegistry → DomainPlugin：claims / investment / example（通用问答走助手图内分流）
   ↓
 LangGraph：对话图 或 案件状态机
   ↓

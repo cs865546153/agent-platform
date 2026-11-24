@@ -68,7 +68,6 @@ rsync -az \
     --exclude 'htmlcov' \
     --exclude 'models/bge-m3' \
     --exclude 'models/bge-reranker-base' \
-    --exclude 'My_Study' \
     --exclude 'isolated_deep' \
     ./ "$REMOTE:$REMOTE_DIR/"
 

@@ -17,7 +17,7 @@ for arg in "$@"; do
   case "$arg" in
     --no-reload|--no_reload) reload=0 ;;
     --reload) reload=1 ;;
-    ''|*[!0-9]*) echo "未知参数：$arg（可用：端口号、--reload、--no-reload）" >&2; exit 2 ;;
+    ''|*[!0-9]*) echo "未知参数：${arg}（可用：端口号、--reload、--no-reload）" >&2; exit 2 ;;
     *) port="$arg" ;;
   esac
 done
@@ -63,7 +63,6 @@ if [[ "$reload" == 1 ]]; then
     --reload-exclude "$venv_abs"
     --reload-exclude "$root/.git"
     --reload-exclude "$root/.data"
-    --reload-exclude "$root/My_Study"
   )
 fi
 
@@ -71,6 +70,6 @@ echo "项目目录: $root"
 echo "虚拟环境: $VENV_DIR"
 echo "监听地址: http://127.0.0.1:$port/"
 echo "热重载  : $([[ "$reload" == 1 ]] && echo '开（改代码自动重启）' || echo '关')"
-echo "应用日志: $app_log（由 .env 的 LOG_FILE 控制）"
+echo "应用日志: ${app_log}（由 .env 的 LOG_FILE 控制）"
 echo "uvicorn日志: $uvicorn_log"
 "$VENV_DIR/bin/uvicorn" "${args[@]}" 2>&1 | tee -a "$uvicorn_log"
