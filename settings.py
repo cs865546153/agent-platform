@@ -36,11 +36,13 @@ class Settings(BaseSettings):
     milvus_uri: str = 'http://127.0.0.1:19530'
     # 应用实际使用的向量库地址：本地 Milvus Lite 用 .db 路径，远程/容器用 HTTP。
     vector_store_uri: str | None = None
-    # 投资知识库 RAG：Wiki 走 BM25，BGE-M3 + Milvus 走向量召回；不可用时自动降级。
+    # 示例领域（投资）配置：仅由 InvestmentPlugin 读取，内核不依赖这些字段。
+    # 模板使用者替换业务领域时可整段删除，并让新插件从自己的配置源读取。
     investment_rag_enabled: bool = True
     investment_rag_collection: str = 'investment_wiki'
     investment_rag_top_k: int = 4
     # 通用知识库 RAG：目录内 Markdown/TXT/PDF/DOCX/HTML 自动切分，按 domain 懒加载。
+    # 该项服务于内核的 /api/rag/* 通用路由，属于横切能力而非某个业务领域。
     knowledge_rag_enabled: bool = True
     knowledge_base_dir: str = 'data/knowledge_base'
     knowledge_rag_collection: str = 'knowledge_general'

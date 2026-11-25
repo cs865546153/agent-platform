@@ -1,14 +1,15 @@
 """验证HTTP存活、OpenAPI契约及理赔状态机；不调用真实模型或业务接口。"""
 import argparse
-import os
 import time
 import uuid
 import httpx
 
+from agent_core.security import resolve_api_key
+
 
 def check(base_url: str, max_latency: float = 5) -> dict[str, float]:
     timings = {}
-    headers = {'X-API-Key': os.getenv('CLAIMS_API_KEY', '')}
+    headers = {'X-API-Key': resolve_api_key()}
     with httpx.Client(base_url=base_url, headers=headers, timeout=max_latency, trust_env=False) as client:
         for path in ('/health', '/openapi.json'):
             start = time.monotonic()

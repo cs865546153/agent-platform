@@ -1,10 +1,12 @@
-# 理赔领域声明：意图清单随插件走，不再由全局 configs/domains.yaml 独占。
+# 理赔领域声明：意图清单与能力绑定随插件走，不再由全局 configs/domains.yaml 独占。
 # 格式与 configs/domains.yaml 的单个领域条目一致（DomainManifest）。
+# 每个意图的 capability 对应 domains/claims/assistant_handlers.py 中注册的实现；
+# 内核只按能力名派发，不认识"理赔"这个概念。
 name: claims
 description: 保险理赔与保单服务：报案、材料、保单、条款、进度和补充材料
 description_en: "Insurance claims and policy services: reporting, documents, policy, clauses, progress, and supplements"
 version: 1.0.0
-capabilities: [policy_query, claim_workflow, rag, outbox]
+capabilities: [policy_query, claim_workflow, claims_answer, rag, outbox]
 intents:
   - name: 理赔报案
     description: 描述事故或询问如何发起理赔申请
@@ -14,6 +16,7 @@ intents:
       - 我想申请医疗理赔
     risk: medium
     mode: conversation
+    capability: claim_workflow
   - name: 材料审核
     description: 检查已上传单证的内容、完整性或真伪
     description_en: Review uploaded claim documents for content, completeness, or authenticity
@@ -21,6 +24,7 @@ intents:
       - 帮我看看这份发票和病历齐不齐
     risk: medium
     mode: conversation
+    capability: claim_workflow
   - name: 进度查询
     description: 询问案件当前处理到哪一步、预计何时完成
     description_en: Ask about the current progress or expected completion time of a claim
@@ -28,6 +32,7 @@ intents:
       - 我的理赔现在到哪一步了？
     risk: low
     mode: conversation
+    capability: claims_answer
   - name: 条款咨询
     description: 询问保障责任、免责条款或具体理赔规则
     description_en: Ask about coverage, exclusions, or specific claim rules
@@ -35,6 +40,7 @@ intents:
       - 这个保险保不保自然灾害？
     risk: low
     mode: conversation
+    capability: claims_answer
   - name: 保单查询
     description: 查询某个具体保单号的状态、保额、有效期或是否有效
     description_en: Look up a specific policy status, coverage amount, validity, or expiry
@@ -42,6 +48,7 @@ intents:
       - 帮我查一下保单 POL-2024-001 还有效吗？
     risk: low
     mode: conversation
+    capability: policy_query
   - name: 补充材料
     description: 询问需要、缺少、上传或补交哪些理赔资料
     description_en: Ask which claim documents are required, missing, uploaded, or to be supplemented
@@ -50,3 +57,4 @@ intents:
       - 还缺什么资料？
     risk: medium
     mode: conversation
+    capability: claim_workflow

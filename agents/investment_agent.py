@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from typing import Any, TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
@@ -315,6 +316,42 @@ def build_demo_trace(state: InvestmentState, request: InvestmentRequest) -> list
     ]
 
 
+TRADE_REQUIRED_FIELDS: tuple[str, ...] = ("product_id", "amount", "risk_profile")
+
+
+def missing_trade_fields(state: Mapping[str, Any]) -> list[str]:
+    """交易指令缺少哪些要素；图与路由共用同一判据，避免两处口径分叉。
+
+    接受只读 Mapping，使 InvestmentState（TypedDict）与 dict 都能直接传入。
+    """
+    return [field for field in TRADE_REQUIRED_FIELDS if not state.get(field)]
+
+
+def awaiting_trade_confirmation(state: dict[str, Any]) -> bool:
+    """状态是否停在"要素齐备、等待二次确认"这一点上。
+
+    进程重启后 LangGraph 不再暴露中断载荷，路由只能从状态重建该判断；
+    条件与 ``intake`` 分支保持一致（要素齐备且尚未确认）。
+    """
+    return (state.get("intent") == "交易指令"
+            and not missing_trade_fields(state)
+            and not state.get("confirmed"))
+
+
+def pending_trade_gate(state: dict[str, Any], pending: tuple[str, ...]) -> str | None:
+    """用 ``(状态, 待执行节点)`` 重建交易链路的 HITL 阶段。
+
+    与 ``interrupt_kind`` 同义，但重启后仍可用：投资图的两处中断分别落在
+    ``intake``（补要素 / 二次确认）和 ``review``（人工审批）节点上。
+    """
+    if "review" in pending:
+        return "investment_review"
+    if "intake" in pending:
+        return ("trade_confirmation" if awaiting_trade_confirmation(state)
+                else "investment_information")
+    return None
+
+
 def build_investment_graph(
     services: InvestmentServices | None = None,
     checkpointer: Any = None,
@@ -326,11 +363,7 @@ def build_investment_graph(
     def intake(state: InvestmentState) -> dict[str, Any]:
         updates: dict[str, Any] = {}
         if state.get("intent") == "交易指令":
-            missing = [
-                field
-                for field in ("product_id", "amount", "risk_profile")
-                if not state.get(field)
-            ]
+            missing = missing_trade_fields(state)
             if missing:
                 answer = interrupt(
                     {
@@ -549,10 +582,14 @@ __all__ = [
     "DemoInvestmentServices",
     "InvestmentServices",
     "InvestmentState",
+    "TRADE_REQUIRED_FIELDS",
+    "awaiting_trade_confirmation",
     "build_demo_trace",
     "build_investment_graph",
     "investment_advice_from_state",
     "investment_initial_state",
     "investment_state_to_response",
+    "missing_trade_fields",
+    "pending_trade_gate",
     "run_demo_investment",
 ]

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
+from fastapi import HTTPException
 
 from agent_core.plugins import AppContext
 
@@ -35,6 +37,49 @@ def interrupt_value(snapshot: Any) -> dict[str, Any] | None:
 def interrupt_kind(snapshot: Any) -> str | None:
     value = interrupt_value(snapshot)
     return str(value.get("kind")) if value else None
+
+
+def resume_gate(snapshot: Any,
+                derive: Callable[[dict[str, Any], tuple[str, ...]], str | None]) -> str | None:
+    """当前停留的中断阶段，兼容进程重启。
+
+    中断载荷（``kind``）只在同一进程内可靠：LangGraph 重启后不再重建
+    ``tasks[].interrupts``，快照里只剩状态和 ``next`` 中的待执行节点。响应体如果
+    直接依赖 ``interrupt_kind``，重启后就会把"等待二次确认"这样的关键状态告诉
+    客户端为"没有中断"。这里让领域用 ``(状态, 待执行节点)`` 自行重建。
+    """
+    kind = interrupt_kind(snapshot)
+    if kind is not None:
+        return kind
+    values = getattr(snapshot, "values", None)
+    if not isinstance(values, dict):
+        return None
+    return derive(values, tuple(snapshot.next or ()))
+
+
+async def gate_resume(graph: Any, config: dict[str, Any], *, kind: str,
+                      not_found: str, conflict: str,
+                      node: str | None = None,
+                      still_waiting: Callable[[dict[str, Any]], bool] | None = None) -> Any:
+    """恢复态门控：确认图正停在 ``kind`` 中断点，并返回快照。
+
+    每个领域都有"补材料 / 二次确认 / 人工审批"这类 HITL 恢复入口，门控完全同形：
+    会话不存在 404，没停在期望阶段 409。放在基类里，避免各领域各写一份判定。
+
+    ``kind`` 只在**同一进程**内可靠：LangGraph 重启后不会重建 ``tasks[].interrupts``，
+    快照里只剩 ``next`` 里的待执行节点名。所以领域可以额外给出 ``node``（中断所在的
+    节点）作为重启后的判据；同一节点承载多种中断时，再用 ``still_waiting`` 从状态里
+    重建"确实还停在这一种中断上"的条件，避免重启后把恢复值喂给错误的中断点。
+    """
+    snapshot = await graph.aget_state(config)
+    if not snapshot.values:
+        raise HTTPException(404, not_found)
+    if interrupt_kind(snapshot) == kind:
+        return snapshot
+    if (node is not None and node in (snapshot.next or ())
+            and (still_waiting is None or still_waiting(snapshot.values))):
+        return snapshot
+    raise HTTPException(409, conflict)
 
 
 class DomainPluginBase:
@@ -88,4 +133,5 @@ class DomainPluginBase:
 # 用注册时的结构化校验替代 issubclass：Protocol 带数据成员时不支持运行时 issubclass。
 
 
-__all__ = ["DomainPluginBase", "graph_config", "interrupt_value", "interrupt_kind"]
+__all__ = ["DomainPluginBase", "graph_config", "gate_resume", "interrupt_value",
+           "interrupt_kind", "resume_gate"]

@@ -211,7 +211,7 @@ def test_rag_search_and_answer_endpoints(monkeypatch: pytest.MonkeyPatch) -> Non
 
     with TestClient(create_app(
         database=':memory:',
-        investment_rag=False,
+        overrides={'investment_rag': False},
         knowledge_rag=rag,
         knowledge_model=_AnswerModel(),
     )) as client:
@@ -247,7 +247,7 @@ def test_search_audit_records_retrieval_diagnostics(monkeypatch: pytest.MonkeyPa
 
     with TestClient(create_app(
         database=':memory:',
-        investment_rag=False,
+        overrides={'investment_rag': False},
         knowledge_rag=rag,
         knowledge_model=_AnswerModel(),
     )) as client:

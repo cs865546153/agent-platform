@@ -1,10 +1,11 @@
 # 示例领域意图声明：抄改这个文件即可让 JEV/LLM 识别你的新领域。
 # 默认注册表不启用 example；按需在 domains/registry.py 登记后生效。
+# 新增领域 = 声明意图 + 绑定 capability + 在插件里注册 handler，内核零改动。
 name: example
 description: 示例领域，用于演示如何声明新领域与意图
 description_en: "Example domain demonstrating how to declare a new domain and its intents"
 version: 0.1.0
-capabilities: []
+capabilities: [example_answer]
 intents:
   - name: 示例问候
     description: 向示例领域打招呼，验证新领域意图已被识别
@@ -14,3 +15,4 @@ intents:
       - hello example
     risk: low
     mode: conversation
+    capability: example_answer

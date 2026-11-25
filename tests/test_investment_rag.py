@@ -164,7 +164,7 @@ def test_context_contains_citation_ids_and_safety_boundary() -> None:
 
 
 def test_investment_rag_endpoint_returns_citations() -> None:
-    with TestClient(create_app(database=':memory:', investment_rag=_fake_rag)) as client:
+    with TestClient(create_app(database=':memory:', overrides={'investment_rag': _fake_rag})) as client:
         response = client.post('/api/investment/rag/search', json={'question': '什么是分散化？', 'top_k': 2})
 
     assert response.status_code == 200
@@ -182,8 +182,8 @@ def test_assistant_injects_investment_rag_context_and_trace() -> None:
         intent_model=_Classifier(),
         general_model=model,
         assistant_model=model,
-        investment_model=model,
-        investment_rag=_fake_rag,
+        models={'investment_advice': model},
+        overrides={'investment_rag': _fake_rag},
     )) as client:
         response = client.post(
             '/api/assistant/stream',

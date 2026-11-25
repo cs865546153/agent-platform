@@ -237,7 +237,7 @@ RouteDecision ──判断──┤
 
 | 能力 | 接入层（全局） | 模型层（专家调用） |
 | --- | --- | --- |
-| 认证 | 接入层强制 `X-API-Key`；`X-Reviewer-Key` 由审核类接口校验；`/api/demo/*` 与探针公开 | — |
+| 认证 | 接入层强制 `X-API-Key`；`X-Reviewer-Key` 由审核类接口校验；`/api/demo/*` 与探针公开。密钥解析统一走 `agent_core/security.resolve_api_key()`（`API_KEY` 优先、`CLAIMS_API_KEY` 兼容），中间件与路由依赖共用 | — |
 | 限流 | 按「身份 + 来源 IP + 接口类别」分桶：通用 1200/min、流式 120/min、单证 120/min | 每案件 10 令牌、1/s |
 | 脱敏 | 审计落库前统一 `mask_pii`，日志只存 IP 哈希 | 输入/输出/缓存值全部脱敏 |
 | 审计 | append-only + 哈希链（`agents/audit_store.py`），记录 request_id/状态/耗时/脱敏入参 | stdout JSON 明细 |
@@ -257,7 +257,7 @@ python -m scripts.audit_verify --limit 10    # 退出码 0 = 链完整
 
 ---
 
-## 3. 理赔对话链路（当前实际）
+## 3. 对话助手链路（当前实际）
 
 ```text
 用户消息
@@ -269,20 +269,16 @@ python -m scripts.audit_verify --limit 10    # 退出码 0 = 链完整
 build_assistant_graph
   │
   ▼
-classify（识别理赔意图）
-  │
-  ├─ 理赔报案 / 材料审核 / 补充材料
-  │       │
-  │       ▼
-  │   material_gate
-  │       ├─ 材料齐全 ──▶ 业务处理 / RAG / 工具
-  │       └─ 材料缺失 ──▶ 生成补件清单
-  │
-  ├─ 进度查询 / 保单查询 / 条款咨询
-  │       └─▶ 查询工具 / 条款 RAG
+classify（IntentRouter：JEV / LLM / Hybrid，失败回落内置分类）
   │
   ▼
-formal_review（正式性 / 合规复核）
+IntentRoutingPolicy.resolve —— 按领域 manifest 的 capability 解析落点
+  │
+  ├─ 清单外的意图 ──▶ 内核 answer（通用问答，trace 标 declared=false）
+  ├─ 高风险且领域未实现 ──▶ 内核 guard（拦截并转人工）
+  ├─ 理赔域 ──▶ policy_query / claim_workflow / claims_answer
+  │              └─ 材料齐全才进核赔，缺材料回流追问（≤3 轮）
+  └─ 投资域 ──▶ investment_answer（RAG） / trade_gate（交易只拦截）
   │
   ▼
 SSE 流式返回
@@ -292,8 +288,9 @@ SSE 流式返回
 
 - **轻量、同步 / 流式、低风险**
 - 主要解决“问、查、引导、补件提示”
-- 当前 `app.py` 仍然走这条链路里的 `classify` 节点
-- 目标态下，`classify` 会由新的 `IntentRouter` 接管或前置
+- `classify` 已由 `IntentRouter` 接管，路由异常回落内置分类模型，SSE 不中断
+- 落点名称来自领域清单而非图代码：内核只内置 `answer` / `guard`，其余能力由
+  `domains/*/assistant_handlers.py` 注册，新增领域不改编排层
 
 ---
 
@@ -517,7 +514,9 @@ ObjectStore:  Local    → S3 / OSS
 | 路径 | 作用 |
 |---|---|
 | `app.py` | FastAPI 入口、SSE、理赔接口；启动时 `build_assistant_intent_router()` |
-| `agents/assistant_agent.py` | 理赔对话图：`classify` / `material_gate` / `formal_review` |
+| `agents/assistant_agent.py` | 领域无关的对话编排图：`classify`（意图路由 + 清单校验）→ 按 `capability` 分派 |
+| `agent_core/capabilities.py` | 对话编排能力表：内置 `answer` / `guard`，其余由领域注册；`missing_handlers` 供启动校验 |
+| `domains/*/assistant_handlers.py` | 领域侧对话能力实现（保单查询、材料门控、核赔、投资 RAG、交易拦截） |
 | `agents/claim_agent.py` | 理赔案件状态机、三专家、`route_decision` |
 | `agents/middleware_audit.py` | PII 脱敏、限流、缓存、审计、HITL |
 | `config.py` | 模型工厂与现有两套路由 |

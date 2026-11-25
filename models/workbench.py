@@ -1,8 +1,14 @@
-"""理赔工作台的单证识别与问答契约。"""
+"""工作台的单证识别与问答契约。
+
+``IntentResult`` / ``ChatTurn`` 是领域无关的内核契约：意图名来自领域清单，
+业务编号统一进 ``slots``。``claim_id``、``material_round`` 与
+``DemoClaimRunResponse`` 仍随示例理赔工作台保留——它们是示例前端的请求形态，
+不是内核的路由词汇，自定义前端可以裁掉。
+"""
 
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from models.schemas import ClaimRequest, ClaimResponse
 
@@ -10,20 +16,12 @@ from models.schemas import ClaimRequest, ClaimResponse
 FieldName = Annotated[str, Field(min_length=1, max_length=50)]
 FieldValue = Annotated[str, Field(max_length=300)]
 WarningText = Annotated[str, Field(min_length=1, max_length=500)]
-IntentName: TypeAlias = Literal[
-    "理赔报案",
-    "材料审核",
-    "进度查询",
-    "条款咨询",
-    "保单查询",
-    "补充材料",
-    "投资咨询",
-    "组合诊断",
-    "风险评估",
-    "产品查询",
-    "交易指令",
-    "一般咨询",
-]
+# 业务槽位由领域清单声明、由领域能力处理器解释，内核只约束形态。
+SLOT_VALUE_LIMIT = 64
+SlotValue = Annotated[str, Field(min_length=1, max_length=SLOT_VALUE_LIMIT)]
+# 意图名由领域清单（插件 manifest.yaml）声明，内核契约不硬编码具体业务意图，
+# 否则新增领域必须改这里。"是不是合法意图"由 DomainRegistry 在运行期判定。
+IntentName: TypeAlias = Annotated[str, Field(min_length=1, max_length=64)]
 
 
 class DocumentAnalysis(BaseModel):
@@ -66,12 +64,27 @@ class AssistantRequest(BaseModel):
 
 
 class IntentResult(BaseModel):
-    """模型对当前用户消息的意图识别结果。"""
+    """模型对当前用户消息的意图识别结果。
 
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    除 ``intent`` / ``confidence`` 外，模型还可能按领域清单输出业务编号字段
+    （如保单号）。内核不枚举这些字段名：多出来的键统一收进 ``slots``，
+    由对应领域的能力处理器解释。这样新增领域不需要改契约模型。
+    """
+
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
     intent: IntentName
     confidence: float = Field(ge=0, le=1)
-    policy_id: str | None = Field(default=None, max_length=64)
+    slots: dict[FieldName, SlotValue] = Field(default_factory=dict, max_length=10)
+
+    @model_validator(mode="after")
+    def fold_extra_slots(self) -> "IntentResult":
+        extra = self.model_extra or {}
+        for key in list(extra):
+            value = extra.pop(key)
+            if isinstance(value, str) and value.strip():
+                self.slots.setdefault(key, value.strip()[:SLOT_VALUE_LIMIT])
+        return self
 
 
 class DemoClaimRunResponse(BaseModel):

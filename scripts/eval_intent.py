@@ -25,6 +25,9 @@ from dotenv import load_dotenv
 from agent_core.intent.contracts import IntentRequest, Turn
 from agent_core.intent.factory import PRESETS, IntentConfig, build_intent_classifier
 from agent_core.intent.registry import DomainRegistry
+from agents.middleware_audit import mask_pii
+from config import get_model
+from domains.registry import default_domain_registry
 from settings import Settings
 
 load_dotenv(Path(".env"), override=False)
@@ -270,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
     rows = load_rows(Path(args.data))
     if args.limit:
         rows = rows[: args.limit]
-    registry = DomainRegistry.default()
+    registry = default_domain_registry()
     try:
         validate_labels(rows, registry)
     except (KeyError, ValueError) as exc:
@@ -290,7 +293,10 @@ def main(argv: list[str] | None = None) -> int:
         config = replace(config, translate_to_english=True)
 
     try:
-        classifier = build_intent_classifier(config, registry=registry)
+        classifier = build_intent_classifier(
+            config, registry=registry,
+            llm_model=get_model('classification'), mask=mask_pii,
+        )
         results = asyncio.run(run_all(rows, classifier, args.concurrency))
     except Exception as exc:  # noqa: BLE001 - CLI 需要友好错误
         print(f"评测失败：{type(exc).__name__}: {exc}", file=sys.stderr)

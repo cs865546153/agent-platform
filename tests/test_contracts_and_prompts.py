@@ -91,3 +91,23 @@ def test_version_fallback_is_exact_and_immutable(tmp_path):
         registry.load('review', '1.0.0', lambda *args: {'name': 'review', 'version': '2.0.0'})
     with pytest.raises(ValueError):
         registry.load('../secret', '1.0.0')
+
+
+def test_intent_contract_carries_manifest_slots_not_field_names():
+    """意图契约只约束形态：业务编号字段自动收进 slots，内核无需认识字段名。"""
+    from models.workbench import SLOT_VALUE_LIMIT, IntentResult
+
+    result = IntentResult.model_validate_json(
+        '{"intent":"任意领域意图","confidence":0.9,'
+        '"policy_id":"POL-2024-001","case_no":"CLM-2026-001"}'
+    )
+    assert result.intent == '任意领域意图'
+    assert result.slots == {'policy_id': 'POL-2024-001', 'case_no': 'CLM-2026-001'}
+    # 溢出长度截断、空值丢弃，且原始回显不再出现在 dump 里（避免 trace 重复）。
+    long = IntentResult.model_validate_json(
+        '{"intent":"新领域","confidence":0.8,'
+        f'"code":"{"X" * 120}","blank":""}}'
+    )
+    assert long.slots == {'code': 'X' * SLOT_VALUE_LIMIT}
+    assert 'code' not in long.model_dump()
+    assert 'blank' not in long.model_dump()

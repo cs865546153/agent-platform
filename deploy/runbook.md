@@ -9,7 +9,7 @@
 - 发布失败：`APP_IMAGE=registry/claims:固定版本 ./deploy.sh prod --rollback`，仅回退应用镜像；保留数据库和Outbox。回退前确认Schema向后兼容，脚本不会自动回滚不可逆数据库变更。
 - 队列积压：检查消费者租约和下游幂等键；先对账再补投，不能以“本地未确认”推断“下游未付款”。
 
-基础设施服务仅绑定本机；生产更换MinIO默认教学凭证、配置CLAIMS_API_KEY及REVIEWER_API_KEY、TLS和组织认证。LangFuse保存脱敏信息，但正则脱敏不覆盖所有自由文本地址/姓名，真实数据上线前需组织内PII识别与访问控制审核。
+基础设施服务仅绑定本机；生产更换MinIO默认教学凭证、配置API_KEY（兼容旧名CLAIMS_API_KEY）及REVIEWER_API_KEY、TLS和组织认证。LangFuse保存脱敏信息，但正则脱敏不覆盖所有自由文本地址/姓名，真实数据上线前需组织内PII识别与访问控制审核。
 
 LangFuse使用独立Compose文件，必须配置数据库密码、认证secret和salt；生产固定镜像digest。创建项目后将public/secret key写入未入库的.env，再运行 `python -m demos.langfuse_demo --invoke`。未看到实际Trace前，不算完成联调。
 

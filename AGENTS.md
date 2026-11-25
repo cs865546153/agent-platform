@@ -48,10 +48,10 @@ app.py                  FastAPI 路由、lifespan、SSE、工作台接口
 settings.py             Pydantic 环境配置、URL/密钥校验
 config.py               模型工厂、任务档位路由、LangChain 模型缓存
 logging_setup.py        日志、请求 ID、轮转、脱敏
-monitoring.py           Prometheus 业务指标
+monitoring.py           Prometheus 指标（METRIC_PREFIX 可配）
 health_check.py         健康与状态机验证
 agents/                 接入层、理赔/投资/对话编排、审计、可观测性
-  assistant_agent.py    /api/assistant/stream 的无状态对话图
+  assistant_agent.py    /api/assistant/stream 的无状态对话图（按能力名动态建图，无业务词）
   claim_agent.py        理赔 LangGraph 状态机、Send 三专家、HITL
   investment_agent.py   投资域图、交易二次确认与人工审批
   http_middleware.py    请求 ID / 认证 / 限流 / 审计 / 异常兜底
@@ -68,16 +68,17 @@ tools/                  业务工具、RAG、Milvus、rerank、文档解析
 adapters/               真实业务适配器（HTTP + 熔断 + 降级）与 demo 后端
 agent_core/             领域无关内核
   plugins.py            DomainPlugin 协议、AppContext、PluginRegistry（模板扩展点）
-  security.py           API Key / 审核员认证、生产密钥校验
-  sse.py                SSE 帧编码
+  capabilities.py       对话编排能力注册表：按能力名分派，内置 answer / guard
+  security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容）、生产密钥校验
+  sse.py                SSE 帧编码（app.py 已接入）
   intent/               意图路由公共层：JEV / LLM / Hybrid / Registry / adapter
 domains/                领域插件（可增删，新增领域不改内核）
   registry.py           默认领域登记表（唯一"启用哪些领域"的事实源）
-  base.py               插件基类 + LangGraph 中断/配置共用辅助
-  claims/               示例域：理赔服务装配、图、核心路由
-  investment/           示例域：投资服务装配、图、核心路由
+  base.py               插件基类 + LangGraph 中断/配置/HITL 恢复门控共用辅助
+  claims/               示例域：理赔服务装配、图、核心路由、对话能力与演示路由
+  investment/           示例域：投资服务装配、图、核心路由与对话能力
   example/              最小示例：演示新领域如何接入
-TEMPLATE.md             模板定位、内核/领域边界、新增领域三步指南
+TEMPLATE.md             模板定位、内核/领域边界、新增领域五步指南
 configs/domains.yaml    领域/意图回退清单（含 description_en）；主事实源已随插件 manifest.yaml
 data/investment_wiki/   投资 Wiki 源文件（约 55 chunks）
 data/knowledge_base/    通用知识库源文件（当前约 3 chunks）
@@ -181,8 +182,9 @@ lsof -nP -iTCP:8001 -sTCP:LISTEN
 
 - 认证由 `EnterpriseHttpMiddleware` 与路由依赖共同负责，请求头为 `X-API-Key`；
   审核接口另需 `X-Reviewer-Key`。
-- `APP_ENV=production` 启动时强制要求 `CLAIMS_API_KEY` 与 `REVIEWER_API_KEY`，
-  长度至少 16 位且不能是常见弱口令。
+- `APP_ENV=production` 启动时强制要求 `API_KEY`（兼容旧名 `CLAIMS_API_KEY`）与
+  `REVIEWER_API_KEY`，长度至少 16 位且不能是常见弱口令；解析统一走
+  `agent_core/security.resolve_api_key()`，中间件与路由依赖共用，不再有两套实现。
 - 限流是进程内实现，多副本需要换 Redis。
 
 ## 编排链路
@@ -194,17 +196,24 @@ lsof -nP -iTCP:8001 -sTCP:LISTEN
 
 ```text
 START
-  → classify（LLM 输出 intent + confidence + policy_id）
-  → 条件路由
-      ├─ 一般咨询      → END（general 模型流式回答）
-      ├─ 投资意图      → 投资 RAG → END（investment 模型流式回答）
-      ├─ 交易指令      → investment_trade → END（只拦截，不执行下单）
-      ├─ 保单查询      → policy_query → END（缺保单号则反问）
-      └─ 其他理赔意图  → material_gate
-                          ├─ 缺材料 → follow_up → END（最多 3 轮，超限转人工）
-                          └─ 材料齐 → formal_review → END（三专家 + RAG 判责）
+  → classify（意图路由 → 领域清单解析出「能力名」）
+  → 条件路由（节点集合 = 已注册能力名 + 内核内置 answer / guard）
+      ├─ answer（内核）        → END（general 模型流式回答）
+      ├─ guard（内核）         → END（案件型 / 高风险意图未实现时拦截，不自动执行）
+      ├─ claims_answer / policy_query / claim_workflow（理赔插件注册）
+      │     └─ claim_workflow：缺材料 → follow_up（最多 3 轮，超限转人工）
+      │                          材料齐 → 三专家 + RAG 判责
+      └─ investment_answer / trade_gate（投资插件注册）
+            └─ trade_gate：只拦截，不下单
 ```
 
+- 内核里没有业务领域名，也没有意图字符串：落点来自领域清单的
+  `IntentSpec.capability`，处理器来自 `ctx.capabilities`（`agent_core/capabilities.py`）。
+  清单未声明能力或没人实现时，按 `mode` / `risk` 回落：`case` 或 `high` → `guard`，其余 → `answer`。
+- 分类模型输出的 `intent` 不再受内核枚举约束（`models/workbench.py` 的 `IntentName` 是
+  受长度约束的 str）；清单外的意图只降级为通用问答并在 `route` trace 记 `declared=false`，
+  分类结果非契约 JSON 时降级为 `未识别`，两者都不中断 SSE。
+- 业务编号等字段统一进 `IntentResult.slots`（额外键自动收拢），内核不枚举字段名。
 - 意图分类：优先走 `IntentRouter`（`application.state.intent_router`），默认 `shadow`
   （LLM 主路由 + JEV 影子）；路由异常回落 `get_model('classification')` 内置提示分类，
   两者最终都收敛为 `IntentResult`。
@@ -213,6 +222,8 @@ START
 - 交易指令在对话链路只做拦截和提示，不会下单；正式流程走 `/api/investment/*` 的
   二次确认 + 人工审批。
 - 修改意图分类或路由时，优先用真实 `/api/assistant/stream` 验证 SSE 事件顺序。
+- 边界门禁：`tests/test_template_boundary.py` 用源码扫描钉住"内核不 import 业务模块、
+  不出现意图字符串、不残留旧分支词汇、装配后无未实现能力"，改内核前先跑它。
 
 ### 2. 理赔状态机：`/api/claims/*`
 
@@ -263,12 +274,17 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
 - `agent_core/intent/factory.py`：`shadow / hybrid / jev / llm` 四种预设。
 - `agent_core/intent/registry.py`：`DomainRegistry.from_plugins()` 从插件 `manifest.yaml`
   聚合领域清单，`configs/domains.yaml` 仅回退补齐无插件领域（如 general）。
-  `agents/assistant_agent.py` 的 `IntentRoutingPolicy.from_registry()` 据此派生图内分支，
+  `agents/assistant_agent.py` 的 `IntentRoutingPolicy` 据此把 `(领域, 意图)` 解析成
+  **能力名**（`IntentSpec.capability`，未声明时按 `mode`/`risk` 回落），
   新增领域不要改图代码里的意图字符串。JEV 使用 `description_en`，新增意图务必补英文描述。
+- `agent_core/capabilities.py`：`AssistantCapabilities` 注册表（能力名全局唯一，
+  即对话图节点名）、`Redirect` 意图改写钩子、`with_kernel()` 补内置 `answer`/`guard`、
+  `missing_handlers()` 供装配期自检（`app.py` 会打 warning）。
 - `settings.py` / `.env.example`：`INTENT_ROUTER_ENABLED`、`INTENT_*`、`JEV_*`，
   重试相关为 `JEV_MAX_RETRIES`（默认 2）和 `JEV_RETRY_BACKOFF_S`（默认 0.25）。
 - 测试：`tests/test_intent_jev.py`、`tests/test_intent_hybrid.py`、
-  `tests/test_intent_registry.py`、`tests/test_intent_router_integration.py`。
+  `tests/test_intent_registry.py`、`tests/test_intent_router_integration.py`、
+  `tests/test_capabilities.py`、`tests/test_template_boundary.py`。
 - 评测：`scripts/eval_intent.py` + `data/intent_golden.jsonl`。
 
 预设语义：
@@ -453,6 +469,8 @@ returned=4
   tests/test_intent_hybrid.py \
   tests/test_intent_registry.py \
   tests/test_intent_router_integration.py \
+  tests/test_capabilities.py \
+  tests/test_template_boundary.py \
   tests/test_logging_setup.py
 
 # Ruff
@@ -462,9 +480,13 @@ returned=4
 bash scripts/verify.sh
 ```
 
-当前基线（2026-10-27 接入意图路由后实跑）：
+当前基线（2026-11-25 对话编排可插拔化后实跑）：
 
-- 全量测试：`196 passed, 1 skipped`（含 3 条领域可插拔 + 5 条意图路由可插拔契约测试；跳过项为需真实 Milvus 的集成测试）。
+- 全量测试：`222 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派与
+  内核边界门禁、P0 认证一致性回归；跳过项为需真实 Milvus 的集成测试）。
+- 模板相关契约：`tests/test_domain_plugin_template.py`、
+  `tests/test_intent_plugin_template.py`、`tests/test_capabilities.py`、
+  `tests/test_template_boundary.py`（改内核路由前必须先跑）。
 - 跳过项：`tests/test_milvus_integration.py`，需要真实 Milvus。
 - 已知无害日志：测试结束时 `milvus_lite` 可能打印
   `ValueError: I/O operation on closed file`，不影响结果。
@@ -495,11 +517,16 @@ bash scripts/verify.sh
 - 修改行为、配置、接口、RAG 或意图链路时，同步更新：
   - `README.md`
   - `Architecture.md`
+  - `TEMPLATE.md`（内核/领域边界与新增领域步骤，改装配点时必须同步）
   - `docs/knowledge-rag.md`
   - `docs/investment-rag.md`
   - `docs/platform-architecture-workflow.md`
+  - `demos/完整链路图.md`
   - `.env.example`
   - `AGENTS.md`
+- 往 `app.py` / `agent_core/` / `models/workbench.py` 里加代码前，先跑
+  `tests/test_template_boundary.py`：内核不 import 业务模块、不写意图字符串、
+  不枚举业务字段名；需要领域信息时走 manifest + `ctx.capabilities`。
 - `docs/platform-architecture-workflow.md` 中的 `platform/intent/` 旧路径已清理；
   实际代码在 `agent_core/intent/`，新增代码不要再使用 `platform` 作为包名
   （会遮蔽标准库 `platform`）。
@@ -517,6 +544,14 @@ bash scripts/verify.sh
 - **翻译开关当前不可用**：`LLMTranslator` 复用 `classification` 模型（`json_object`），
   DeepSeek 会因 prompt 不含 “json” 返回 400；开启 `INTENT_TRANSLATE_TO_ENGLISH=true`
   前需先改为 text 模式模型，并重新跑评测。
+- **对话编排已能力化，但工作台请求模型仍带示例形态**：`agents/assistant_agent.py` 与
+  `app.py` 里不再有领域名或意图字符串，落点全部来自领域清单的 `capability`；
+  但 `AssistantRequest.claim_id` / `material_round` 仍是示例理赔工作台的字段
+  （内核只透传，不解释），原创业务需要替换为自己的案件主键。
+- **HITL 中断跨进程会降级**：LangGraph 重启后 `tasks[].interrupts` 不再重建，
+  只有 `snapshot.next` 保留。恢复门控与响应阶段必须用 `domains/base.py` 的
+  `gate_resume(node=...)` / `resume_gate(...)` 按待执行节点重建，只看 `interrupt_kind`
+  会让重启后的 `/confirm`、`/review` 永远 409（投资域曾如此，已修并有回归测试）。
 - **真实理赔闭环未完成**：`BusinessBackend` 只内置 `query_policy`，
   `verify_claim_evidence` 需注册适配器；`CORE_QUERY_URL` 为空时安全降级为转人工。
 - **真实条款语料缺失**：支持 `claims_<险种>` 集合，但仓库没有真实条款，主要用演示条款。

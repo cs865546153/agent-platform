@@ -16,7 +16,8 @@
        v   HTTP / SSE
 【接入层】 EnterpriseHttpMiddleware（纯 ASGI，每个请求；领域无关）
   CORS -> RequestID -> 认证 -> 体积上限 -> 限流 -> 审计 -> 500 兜底
-  认证：/api/* 校验 X-API-Key（agent_core/security.py）；生产启动强制配置密钥
+  认证：/api/* 校验 X-API-Key；Depends 与接入层中间件共用 agent_core/security.resolve_api_key()
+        （API_KEY 优先，CLAIMS_API_KEY 兼容旧部署）；生产启动强制配置密钥
   限流：身份 + IP + 接口类别（进程内；多副本需 Redis）
   审计：脱敏入参 + RAG 检索诊断写入 audit.sqlite，只追加 + 哈希链
        |
@@ -24,9 +25,10 @@
 【内核装配层】 app.py (FastAPI) —— 唯一扩展点 create_app(registry=)
   通用路由：/health · /ready · /metrics · /api/rag/* · /api/assistant/stream · /api/documents/analyze
   领域路由：由 domains/<域>/routes.py 注册，app.py 不认识具体业务
-  演示路由：/api/demo/*（示例应用，可删）
+  演示路由：/api/demo/claims/* 由 ClaimsPlugin 注册（不装 claims 插件即不存在）
        |
-       |  lifespan 中按 registry 装配 AppContext（services / graphs / locks / settings）
+       |  lifespan 中按 registry 装配 AppContext
+       |  （services / graphs / rag / slot_extractors / locks / settings）
        v
 【领域插件层】 domains/ —— 可增删，新增领域不改内核
   PluginRegistry（domains/registry.py，启用哪些领域的唯一事实源）
@@ -38,12 +40,13 @@
        v
 【内核能力层】 agent_core/ —— 领域无关
   plugins.py  : DomainPlugin 协议、AppContext、PluginRegistry
-  security.py : 认证与生产密钥校验；sse.py : SSE 帧编码
-  intent/     : JEV / LLM / Hybrid / Shadow 意图路由（领域清单从插件 manifest 聚合，YAML 回退）
+  capabilities.py : 对话编排能力表（内核只内置 answer / guard，其余由领域注册）
+  security.py : 统一认证与生产密钥校验；sse.py : SSE 帧编码（app.py 已接入）
+  intent/     : JEV / LLM / Hybrid / Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
        |
        v
 【编排层】（领域图由各插件构建，checkpointer 由内核在 lifespan 注入）
-  链路① 对话助手(LangGraph)  : classify(IntentRouter) -> investment / policy_query / material_gate -> follow_up（回答外层流式）
+  链路① 对话助手(LangGraph)  : classify(IntentRouter) -> 按意图清单派落点能力（answer / guard / 领域能力）（回答外层流式）
   链路② 理赔状态机(LangGraph) : intake -> policy -> experts(子图) -> auto/review/investigate
        └ experts 子图          : expert(Send 扇出三专家) -> aggregate
   链路③ 工具/规划(未接主app)  : AgentExecutor、Plan-and-Execute、RunnableWithMessageHistory
@@ -116,27 +119,31 @@ create_app(registry)
   -> lifespan: AsyncSqliteSaver 建立 checkpointer
   -> 各插件 build_graphs(ctx, saver)          # 构建 LangGraph，saver 由内核注入
   -> 各插件 register_routes(ctx)              # 注册领域专属路由，不 import app.py
-  -> 兼容字段 application.state.graph / investment_graph 供既有 demo 路由使用
+  -> 领域图留在 ctx.graphs，由插件路由自行取用；内核不再按领域名挂全局 state
 ```
 
-`AppContext` 持有 `services` / `graphs` / `locks` / `settings` / `application` /
-`intent_router` / `intent_registry`，是内核与插件之间唯一的依赖通道；插件不直接 import `app.py`。
+`AppContext` 持有 `services` / `graphs` / `rag` / `slot_extractors` / `locks` /
+`settings` / `application` / `intent_router` / `intent_registry`，是内核与插件之间
+唯一的依赖通道；插件不直接 import `app.py`，内核也不 import 任何领域类型。
 
 **意图路由同样可插拔**（领域与意图事实源随插件走，内核不再写死）：
 
 ```text
 插件 manifest.yaml（intent_manifest hook）
   -> DomainRegistry.from_plugins(plugins, fallback=DomainRegistry.default())
-       插件声明优先；YAML 只补齐无插件领域（如 general 的助手图内分流）
-  -> build_assistant_intent_router(cfg, intent_model, domain_registry)
-       create_app(intent_router=...) 显式注入时跳过构建，内核不接管其生命周期
-  -> IntentRoutingPolicy.from_registry(...)  # 意图名 -> 图内分支的映射从清单派生
-  -> assistant 图的 general / investment / trade / policy / material 分支
+       插件声明优先；YAML 只补 general；同名内容分叉时启动抛 ValueError
+  -> build_assistant_intent_router(cfg, intent_model, domain_registry, slot_extractor)
+       显式 intent_router 注入时跳过构建，内核不接管其生命周期
+       slot_extractor 来自 AppContext.slot_extractors（领域插件注册的业务槽位规则）
+  -> IntentRoutingPolicy.from_registry(intent_domain_registry, ctx.capabilities)
+       意图 -> IntentSpec.capability（能力名）+ 领域处理器；内核只内置 answer / guard
+  -> assistant 图按能力名动态建节点（节点集合 = 已注册能力名 + 两个内置落点）
 ```
 
-`configs/domains.yaml` 退居回退清单：新增领域只需在插件目录写 `manifest.yaml`，
-无需改全局 YAML、也无需改 `assistant_agent.py` 的意图字符串。契约由
-`tests/test_intent_plugin_template.py` 守护。
+`configs/domains.yaml` 已瘦身为只含 general 的回退清单；完整三域清单由
+`domains.registry.default_domain_registry()` 从插件聚合。新增领域只需在插件目录写
+`manifest.yaml`，无需改全局 YAML，也无需在 `agent_core` 里写业务字段。
+契约由 `tests/test_intent_plugin_template.py` 守护。
 
 **领域无关的横切能力**（对全部领域一律生效，插件无需重复实现）：审计哈希链
 （`agents/audit_store.py`）、接入限流与 500 兜底（`agents/http_middleware.py`）、
@@ -188,8 +195,8 @@ registry = DomainRegistry.from_plugins(plugins, fallback=DomainRegistry.default(
 router = build_assistant_intent_router(cfg, intent_model, registry)  # 可注入；显式 router 时跳过构建
 # agents/assistant_agent.py：classify 节点优先走路由层
 route = await intent_router.classify(question=..., history=..., active_domain=...)
-intent = IntentResult(intent=route.intent, confidence=route.confidence, policy_id=route.policy_id)
-# 路由异常时回落内置分类模型，SSE 不中断，trace 记录 route_error
+intent = IntentResult(intent=route.intent, confidence=route.confidence, slots=route.slots)
+# 业务编号统一进 slots；路由异常时回落内置分类模型，SSE 不中断，trace 记录 route_error
 ```
 
 `INTENT_ROUTER_ENABLED=false` 可整体关闭路由层，回到内置 LLM 分类；路由引擎与阈值见
@@ -199,28 +206,44 @@ intent = IntentResult(intent=route.intent, confidence=route.confidence, policy_i
 
 方案 A：无状态多节点图（`agents/assistant_agent.py`）。图负责编排决策，LLM 流式回答由外层执行器负责。
 
+内核不认识任何领域，也不做意图字符串比较：`classify` 把 `(领域, 意图)` 解析成
+**能力名**（领域清单 `IntentSpec.capability`），对话图的节点集合 = 已注册能力名
+（`ctx.capabilities`）+ 内核内置 `answer` / `guard`。因此新增领域的对话分支只要
+注册能力就能被路由到。
+
 ```
 START
-  -> classify（IntentRouter：JEV/LLM/Hybrid，默认 shadow；输出 intent + confidence + policy_id）
-  -> 条件路由 route_after_classify
-       |-- 一般咨询  -> END（外层流式 general 回答）
-       |-- 投资意图  -> 投资 RAG -> END（外层流式 investment 回答）
-       |-- 交易指令  -> investment_trade -> END（只拦截，不下单）
-       |-- 保单查询  -> policy_query -> END（反问保单号 / 输出保单摘要）
-       |-- 其他理赔  -> material_gate
-                          |-- 缺材料 -> follow_up -> END（回流追问，最多 3 轮 -> 转人工）
-                          |-- 材料齐 -> formal_review -> END（三专家 + RAG 判责）
+  -> classify（IntentRouter：JEV/LLM/Hybrid，默认 shadow；解析出 capability + domain + slots）
+  -> 条件路由 route_after_classify（按能力名选节点，落点未实现时回内置 answer）
+       |-- answer（内核）              -> END（general 模型流式回答）
+       |-- guard（内核）               -> END（案件型/高风险未实现时拦截，不执行）
+       |-- policy_query（理赔插件）     -> END（反问保单号 / 输出保单摘要）
+       |-- claim_workflow（理赔插件）   -> END（缺材料回流追问 ≤3 轮；材料齐三专家 + RAG 判责）
+       |-- claims_answer（理赔插件）    -> END（理赔通用问答）
+       |-- investment_answer（投资插件）-> END（投资 RAG + 流式回答）
+       |-- trade_gate（投资插件）       -> END（只拦截，不下单）
 ```
 
-**节点职责**
+**内置落点**
 
-| 节点 | 职责 |
-|---|---|
-| classify | 调用 IntentRouter 得到 domain/intent/confidence，路由失败回落内置分类模型 |
-| policy_query | 查保单（PolicyStore / CoreSystemAdapter），缺保单号反问，降级/失败转人工 |
-| material_gate | 材料完整性门控 + 提取结构化字段（claim_id / policy_id / amount） |
-| follow_up | 回流追问，最多 3 轮，超限转人工 |
-| formal_review | 正式核赔：保单核验 + 三专家并行 + RAG 判责 + 决策路由 |
+| 能力 | 归属 | 职责 |
+|---|---|---|
+| answer | 内核 | 通用模型直接回答；清单外意图、无处理器的对话都落到这里 |
+| guard | 内核 | 案件型 / 高风险意图没有领域处理器时拦截，提示走业务接口确认 |
+
+**领域注册的落点（示例）**
+
+| 能力 | 领域 | 职责 |
+|---|---|---|
+| policy_query | claims | 查保单（PolicyStore / CoreSystemAdapter），缺保单号反问，降级/失败转人工 |
+| claim_workflow | claims | 材料完整性门控 + 回流追问（≤3 轮，超限转人工）+ 正式核赔（保单核验 + 三专家并行 + RAG 判责） |
+| claims_answer | claims | 理赔相关但无需案件上下文的问答 |
+| investment_answer | investment | 投资 RAG 检索 + 教育性建议 |
+| trade_gate | investment | 交易指令拦截，引导走 `/api/investment/*` 的确认与审批 |
+
+代码位置：`domains/claims/assistant_handlers.py`、`domains/investment/assistant_handlers.py`，
+在各自插件的 `build_services` 里注册；理赔的意图改写钩子（补材料续答继承上一轮意图）
+由 `ctx.capabilities.register_redirect()` 注入，内核不判断改写是否合理。
 
 **trace 观测**
 
@@ -229,7 +252,11 @@ START
 - `engine`：`jev` / `llm` / `llm-prompt`（回落内置分类时）；
 - `route`：`domain` / `intent` / `confidence` / `margin` / `needs_clarification` /
   `fallback_used` / `warnings` / `shadow`；
-- `route_error`：路由异常摘要，出现时表示本轮已回落到内置分类。
+- `route_error`：路由异常摘要，出现时表示本轮已回落到内置分类；兜底分类自身
+  不符合契约时追加 `classify:<异常名>`（不带模型回显），意图按 `未识别` 处理。
+
+`route` 节点输出落点与依据：`selected`（领域）、`capability`（对话图节点名）、
+`handler`（该能力是否有领域实现）、`declared`（意图是否在领域清单里）。
 
 工作台展示位置：「调用链路 → 平台内核」下
 
@@ -245,8 +272,9 @@ START
 ainvoke 图 -> 重放 events（trace + intent + material_status + content）-> 流式 LLM 回答 -> done
 ```
 
-> 链路① 的对话预审与正式核赔已分开：材料齐全才进入 `formal_review`（三专家 + RAG 判责），
-> 缺材料只回流追问；交易指令只拦截不下单。
+> 链路① 的对话预审与正式核赔已分开：材料齐全才由理赔域的 `claim_workflow` 能力进入核赔
+> （三专家 + RAG 判责），缺材料只回流追问；投资域的交易指令由 `trade_gate` 能力只拦截不下单。
+> 这些落点都写在领域 manifest 的 `capability:` 里，内核只认 `answer` / `guard` 两个内置落点。
 > 当前为方案 A（无状态，每次请求新建图）；方案 B（checkpointer + interrupt 断点续跑）见 README。
 
 ## 四、链路② 理赔状态机（LangGraph，/api/claims/*）

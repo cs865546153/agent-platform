@@ -11,19 +11,22 @@
 ## 1. 分层与边界
 
 ```
-app.py                     内核：FastAPI 装配 + 通用路由 + 健康检查/RAG/工作台/SSE
-  └─ create_app(registry=)  唯一扩展点：注入领域插件集，Kernel 不认识任何业务
+app.py                     内核：FastAPI 装配 + 通用路由（health/ready/metrics/RAG/工作台/SSE）
+  └─ create_app(registry=)  唯一扩展点：注入领域插件集；顶层不 import 任何领域类型
+     └─ overrides / models  领域依赖注入点，键名由插件解释（内核签名无领域名）
 agent_core/                领域无关内核
-  ├─ plugins.py            DomainPlugin 协议（含 intent_manifest hook）、AppContext、PluginRegistry
-  ├─ security.py           API Key / 审核员认证、生产密钥校验
-  ├─ sse.py                SSE 帧编码
-  └─ intent/               JEV/LLM/Hybrid/Shadow 意图路由（领域清单从插件 manifest 聚合）
+  ├─ plugins.py            DomainPlugin 协议（intent_manifest）、AppContext（slot_extractors/capabilities）、PluginRegistry
+  ├─ capabilities.py       对话编排能力注册表：内核按"能力名"分派，只内置 answer / guard
+  ├─ security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容旧部署）
+  ├─ sse.py                SSE 帧编码（已接入 app.py，无内联副本）
+  └─ intent/               JEV/LLM/Hybrid/Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
 domains/                   领域插件（可增删）
-  ├─ registry.py           默认领域登记表（唯一"启用哪些领域"的事实源）
-  ├─ base.py               插件基类 + LangGraph 中断/配置共用辅助
-  ├─ claims/               示例域：理赔状态机、三专家、RAG、HITL
-  ├─ investment/           示例域：投资咨询、交易二次确认、人工审批
+  ├─ registry.py           默认领域登记表 + default_domain_registry()（评测/测试聚合完整清单）
+  ├─ base.py               插件基类 + LangGraph 中断/配置/HITL 恢复门控共用辅助
+  ├─ claims/               示例域：理赔状态机、三专家、RAG、HITL、演示路由、对话能力与保单号槽位规则
+  ├─ investment/           示例域：投资咨询、交易二次确认、人工审批、对话能力与投资 RAG 装配
   └─ example/              最小示例：60 行接入一个新领域（可直接抄改）
+configs/domains.yaml       运行时回退清单：只保留无插件领域（general）
 ```
 
 **横切能力**（审计哈希链、接入限流、PII 脱敏、模型缓存/降级、Prometheus/LangFuse）
@@ -36,19 +39,21 @@ domains/                   领域插件（可增删）
 
 | 能力 | 位置 | 领域是否需关心 |
 | --- | --- | --- |
-| RequestID / 认证 / 限流 / 审计 / 500 兜底 | `agents/http_middleware.py` | 否 |
+| RequestID / 认证 / 限流 / 审计 / 500 兜底 | `agents/http_middleware.py` + `agent_core/security.py`（同一密钥解析） | 否 |
 | append-only + 哈希链审计 | `agents/audit_store.py` | 否 |
 | 意图分类 JEV/LLM/Hybrid/Shadow | `agent_core/intent/` | 在插件 manifest.yaml 声明意图即可 |
-| 模型工厂 / 任务档位 / 缓存 / 降级 | `config.py`、`agents/middleware_audit.py` | 否 |
+| 模型工厂 / 任务档位 / 缓存 / 降级 | `config.py`（`LLMFactory`、`register_task_profile()`）、`agents/middleware_audit.py` | 否；领域可注册自己的档位 |
+| 领域槽位兜底抽取 | `AppContext.slot_extractors`，由插件在 `build_services` 注册 | 内核不内置业务字段形态 |
+| 对话编排能力分派 | `agent_core/capabilities.py` + `agents/assistant_agent.py` 动态建图 | 在 `build_services` 里 `ctx.capabilities.register(名字, handler)` |
 | 多路召回 + RRF + BGE-Rerank + 引用校验 | `tools/knowledge_rag.py`、`tools/rerank.py` | 可选复用 |
-| HITL（中断 + 恢复 + 人工审批） | LangGraph `interrupt` + `Command(resume=)` | 图内声明 |
+| HITL（中断 + 恢复 + 人工审批） | LangGraph `interrupt` + `domains/base.py:gate_resume/resume_gate` | 图内声明中断，恢复门控用基类 |
 | SSE 流式回答 | `app.py` assistant 路由 + `agent_core/sse.py` | 否 |
-| Prometheus / LangFuse / 日志脱敏 | `monitoring.py`、`agents/observability.py` | 否 |
+| Prometheus / LangFuse / 日志脱敏 | `monitoring.py`（`METRIC_PREFIX` 可配、插件可 `register_counter`）、`agents/observability.py` | 否 |
 | 上线门禁 / 影子对拍 | `deploy/regression_gate.py`、`deploy/shadow_mode.py` | 否 |
 
 ---
 
-## 3. 新增一个领域（四步）
+## 3. 新增一个领域（五步）
 
 以 `domains/example/` 为骨架：
 
@@ -81,15 +86,26 @@ class MyDomainPlugin(DomainPluginBase):
 `DomainPluginBase.intent_manifest()` 会自动加载插件目录下的 `manifest.yaml`，
 领域与意图声明从此随插件走，不必改全局 YAML（见步骤 2）。
 
-### 步骤 2：声明领域意图（随插件走，可选但推荐）
+需要领域专属槽位（如保单号）或模型档位时，在 `build_services` 里注册，
+内核只负责把抽取器注入意图路由适配器，不认识具体字段：
+
+```python
+from config import TaskProfile, register_task_profile
+
+ctx.slot_extractors[self.name] = my_slot_extractor  # (decision, question, turns) -> dict[str, str]
+register_task_profile('my_task', TaskProfile('plus', 0.3, 1200))
+```
+
+### 步骤 2：声明领域意图与能力绑定（随插件走）
 
 ```yaml
-# domains/my_domain/manifest.yaml —— 与 configs/domains.yaml 单个领域条目同格式
+# domains/my_domain/manifest.yaml —— 格式与 DomainManifest 一致
 name: my_domain
 description: 我的业务领域
 description_en: "My business domain"   # JEV 英文优先，务必提供
 version: 0.1.0
-capabilities: []
+# 能力名是本领域对话落点的声明集合；意图绑定的能力必须在这里出现，否则清单校验报错。
+capabilities: [my_domain_answer, my_domain_submit]
 intents:
   - name: 我的意图
     description: 用户会怎么表达
@@ -97,13 +113,54 @@ intents:
     examples: ["一个示例问题"]
     risk: low
     mode: conversation
+    capability: my_domain_answer     # 对话图落点；留空则按 mode/risk 回落 answer / guard
+  - name: 我的写操作
+    description: 会改变业务状态的请求
+    description_en: "Requests that change business state"
+    risk: high
+    mode: case
+    capability: my_domain_submit
 ```
 
-内核启动时从已启用插件的 `intent_manifest()` 聚合领域清单，
-`configs/domains.yaml` 只用于补齐没有插件的领域（如 general）；
-意图路由器的构建、保单号兜底抽取、图内分支策略都从这份聚合清单派生。
+内核启动时从已启用插件的 `intent_manifest()` 聚合领域清单；
+`configs/domains.yaml` 已瘦身为**只含 general 的回退清单**（完整三域清单请用
+`domains.registry.default_domain_registry()` 从插件聚合）。若插件声明与回退清单
+同名却内容不一致，启动即抛 `ValueError`，避免两份事实源悄悄分叉。
+图内分支与分类提示词都从聚合清单派生；领域专属槽位抽取由插件注入（见步骤 1）。
 
-### 步骤 3：登记领域
+`capability` 是对话图里的节点名。省略时按 `mode` / `risk` 推导：
+`case` 或 `high` → `guard`（拦截并说明需要确认），其余 → `answer`（通用模型直接回答）。
+宁可回落到内置落点，也不会让未实现的分支静默变成自由问答。
+
+### 步骤 3：注册对话能力（让新领域在 `/api/assistant/stream` 可达）
+
+```python
+# domains/my_domain/assistant_handlers.py
+from agents.assistant_agent import conversation_messages, model_inputs
+
+
+async def my_domain_answer(state: dict) -> dict:
+    """state 里可读 intent / slots / documents / history / question；返回状态补丁。"""
+    messages = conversation_messages(state['question'], state['history'], MY_PROMPT)
+    return {'events': [{'trace': {'node': 'my_domain', 'status': 'done',
+                                  'input': model_inputs(MODEL, messages)}}],
+            'llm': MODEL, 'messages': messages, 'needs_llm_answer': True}
+
+
+def register_my_capabilities(ctx, *, model) -> None:
+    ctx.capabilities.register('my_domain_answer', my_domain_answer)
+    # 需要基于会话状态改写落点时（如补材料续答继承上一轮意图）：
+    # ctx.capabilities.register_redirect('my_domain', lambda state: Redirect(...))
+```
+
+在插件的 `build_services` 里调用 `register_my_capabilities(...)` 即可。约束：
+
+- 能力名全局唯一，撞名直接 `ValueError`（能力名即图节点名）；
+- 声明了能力但没注册实现不会报错，只会在装配时打 warning，
+  可用 `agent_core.capabilities.missing_handlers()` 自检（`tests/test_template_boundary.py` 已钉住）；
+- 处理器抛异常时内核显式降级为"转人工"，SSE 不中断。
+
+### 步骤 4：登记领域
 
 ```python
 # domains/registry.py —— 唯一的启用开关
@@ -115,12 +172,14 @@ def default_registry() -> PluginRegistry:
 
 `configs/domains.yaml` 不再是新增领域的必改项；它只保留无插件领域的声明。
 
-### 步骤 4：测试
+### 步骤 5：测试
 
 ```bash
 pytest -q tests/test_domain_plugin_template.py   # 领域可插拔契约
 pytest -q tests/test_intent_plugin_template.py   # 意图路由可插拔契约
-pytest -q                                         # 全量
+pytest -q tests/test_capabilities.py             # 能力分派与动态建图契约
+pytest -q tests/test_template_boundary.py        # 内核边界门禁（源码扫描）
+pytest -q                                        # 全量
 ```
 
 测试里可用 `create_app(registry=PluginRegistry([MyDomainPlugin()]))` 只装自己的域，
@@ -131,8 +190,19 @@ pytest -q                                         # 全量
 
 ## 4. 模板的使用边界（如实说明）
 
-- **`app.py` 仍保留 demo 路由与对话编排**：它们是"示例应用"而非内核的一部分，
-  原创业务可删除 `/api/demo/*` 与 assistant 图，不影响领域插件机制。
+- **演示路由已迁出内核**：`/api/demo/claims/*` 由 `ClaimsPlugin` 注册，不装 claims 插件就不存在；
+  `app.py` 只保留通用路由与 assistant 对话编排，原创业务可删除后者，不影响领域插件机制。
+- **对话编排已按能力分派**：`agents/assistant_agent.py` 不再有业务节点或意图字符串，
+  图节点由"已注册的能力名"动态生成，落点来自领域清单的 `capability`。
+  新增领域按步骤 2/3 声明并注册后，在 `/api/assistant/stream` 自动可达，无需改内核。
+  边界由 `tests/test_template_boundary.py` 用源码扫描钉住（内核不 import 业务模块、
+  不出现意图字符串、不残留旧分支词汇）。
+- **工作台请求模型仍带示例形态**：`AssistantRequest.claim_id` / `material_round` 与
+  `models/workbench.py` 的理赔演示响应属于示例前端契约，内核只透传不解释；
+  原创业务可替换为自己的案件主键，或改用 `slots` 承载。
+- **HITL 恢复跨进程可用**：LangGraph 重启后不再重建中断载荷，快照只剩待执行节点，
+  因此恢复门控与响应阶段都用 `domains/base.py` 的 `gate_resume` / `resume_gate`
+  按 `(状态, 待执行节点)` 重建；领域新增中断点时要一并给出 `node` 判据。
 - **教学产物已迁出**：`My_Study/`、培训追踪清单在 `../teaching-archive/`，不在模板运行时内。
 - **真实联调未完成**：本地 LLM、Milvus、Redis、LangFuse、核心业务系统需按部署环境接入；
   模板不虚构准确率、延迟或成本。详见 `docs/` 各专题与 `deploy/runbook.md`。
@@ -143,13 +213,17 @@ pytest -q                                         # 全量
 
 ---
 
-## 5. 验证基线（2026-11-24）
+## 5. 验证基线（2026-11-25）
 
-- `196 passed, 1 skipped`（原 188 + 3 条领域可插拔 + 5 条意图路由可插拔契约测试；跳过项为需真实 Milvus 的集成测试）
-- Ruff（F 规则）全项目通过；新增领域模块 Mypy 通过
-- 可插拔契约由 `tests/test_domain_plugin_template.py` 守护
-- 真实启动：`bash scripts/start_mac.sh` 后 `/health`、`/ready`、首页与 19 个路由均 200；
-  `POST /api/demo/claims/process` 走完整状态机返回 `accept/confidence=0.95`。
+- `222 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；新增能力分派、
+  内核边界门禁与投资 HITL 重启恢复回归
+- Ruff 全项目通过；本次改动涉及的文件 Mypy 零错误（剩余告警均在未改动的既有模块）
+- 可插拔契约由 `tests/test_domain_plugin_template.py`、`tests/test_intent_plugin_template.py`、
+  `tests/test_capabilities.py`、`tests/test_template_boundary.py` 守护
+- 真实装配冒烟：`/health`、`/ready`、`/openapi.json` 均 200，19 条路由全部注册
+  （含迁移后的 `/api/demo/claims/*`）；`POST /api/demo/claims/process` 走完整状态机；
+  默认插件集注册 `claim_workflow / claims_answer / investment_answer / policy_query / trade_gate`
+  五个对话能力，`missing_handlers()` 为空
 
 > 启动脚本注意：`start_mac.sh` 开了 `set -u`，在 echo 中文提示里 `$var` 后紧跟全角括号时
 > Bash 会把 UTF-8 首字节并进变量名（如 `$app_log（` 误判为 `app_log\xef`），导致启动即报

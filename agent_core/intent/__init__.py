@@ -2,6 +2,8 @@
 
 from .adapter import AssistantIntentRouter, AssistantRoute
 from .contracts import (
+    CAPABILITY_PATTERN,
+    INTENT_LOGGER_NAME,
     DomainManifest,
     IntentClassificationError,
     IntentClassifier,
@@ -9,12 +11,15 @@ from .contracts import (
     IntentSpec,
     RouteDecision,
     Turn,
+    fallback_capability,
 )
 from .registry import DomainRegistry
 
 __all__ = [
     "AssistantIntentRouter",
     "AssistantRoute",
+    "CAPABILITY_PATTERN",
+    "INTENT_LOGGER_NAME",
     "DomainManifest",
     "DomainRegistry",
     "IntentClassificationError",
@@ -23,4 +28,5 @@ __all__ = [
     "IntentSpec",
     "RouteDecision",
     "Turn",
+    "fallback_capability",
 ]

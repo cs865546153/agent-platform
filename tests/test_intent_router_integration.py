@@ -3,18 +3,22 @@
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 
+from agent_core.capabilities import AssistantCapabilities
 from agent_core.intent.adapter import AssistantIntentRouter
 from agent_core.intent.contracts import RouteDecision
 from agent_core.intent.factory import IntentConfig, build_intent_classifier
-from agent_core.intent.registry import DomainRegistry
+from domains.claims.assistant_handlers import register_claims_capabilities
+from domains.claims.plugin import extract_claim_slots
+from domains.registry import default_domain_registry
 from agents.assistant_agent import active_domain_from_history, build_assistant_graph
-from app import build_assistant_intent_router
+from app import build_assistant_intent_router, composite_slot_extractor
 from models.workbench import ChatTurn
 
 
@@ -29,6 +33,13 @@ def _state(question: str, history: list[Any] | None = None) -> dict[str, Any]:
         'started': time.monotonic(),
         'events': [],
     }
+
+
+def _claims_capabilities(service: Any, model: Any) -> AssistantCapabilities:
+    """按领域插件的方式注册理赔能力（AppContext 只用到 ``capabilities``）。"""
+    ctx = SimpleNamespace(capabilities=AssistantCapabilities())
+    register_claims_capabilities(ctx, service=service, model=model)
+    return ctx.capabilities
 
 
 class FakeRouter:
@@ -56,7 +67,8 @@ class FakeRouter:
         return AssistantRoute(
             intent=self.decision.intent,
             confidence=self.decision.confidence,
-            policy_id=self.decision.slots.get('policy_id'),
+            slots={'policy_id': self.decision.slots['policy_id']}
+            if self.decision.slots.get('policy_id') else {},
             decision=self.decision,
         )
 
@@ -99,7 +111,7 @@ def test_router_adapter_maps_history_and_policy_id() -> None:
         engine = FakeEngine(RouteDecision(
             domain='claims', intent='保单查询', confidence=0.94, engine='jev',
         ))
-        router = AssistantIntentRouter(engine)
+        router = AssistantIntentRouter(engine, slot_extractor=extract_claim_slots)
         route = await router.classify(
             question='帮我查一下保单 POL-2024-001 还有效吗？',
             history=[ChatTurn(role='user', content='你好')],
@@ -108,7 +120,7 @@ def test_router_adapter_maps_history_and_policy_id() -> None:
         )
         assert route.intent == '保单查询'
         assert route.confidence == 0.94
-        assert route.policy_id == 'POL-2024-001'
+        assert route.slots['policy_id'] == 'POL-2024-001'
         request = engine.requests[0]
         assert request.message == '帮我查一下保单 POL-2024-001 还有效吗？'
         assert request.history[0].content == '你好'
@@ -123,10 +135,10 @@ def test_router_adapter_skips_policy_id_for_other_intents() -> None:
         engine = FakeEngine(RouteDecision(
             domain='claims', intent='条款咨询', confidence=0.9, engine='jev',
         ))
-        route = await AssistantIntentRouter(engine).classify(
+        route = await AssistantIntentRouter(engine, slot_extractor=extract_claim_slots).classify(
             question='POL-2024-001 这个保险保不保自然灾害？',
         )
-        assert route.policy_id is None
+        assert route.slots == {}
 
     asyncio.run(scenario())
 
@@ -141,14 +153,15 @@ def test_assistant_graph_uses_router_decision() -> None:
         graph = build_assistant_graph(
             classifier=FakeModel('{"intent":"材料审核","confidence":0.5}'),
             general_model=FakeModel('unused'),
-            assistant_model=FakeModel('unused'),
-            service=FakeService(),
             intent_router=router,
         )
         state = await graph.ainvoke(_state('Python 列表推导式是什么？'))
 
         assert state['intent'] == '一般咨询'
         assert state['stage'] == 'general'
+        # 落点由清单派生：general 复用内核内置 answer 能力，交给外层流式回答。
+        assert state['capability'] == 'answer'
+        assert state['needs_llm_answer'] is True
         classification = next(event['trace'] for event in state['events']
                               if event.get('trace', {}).get('node') == 'classification'
                               and event['trace']['status'] == 'done')
@@ -168,8 +181,6 @@ def test_assistant_graph_falls_back_to_builtin_classifier() -> None:
         graph = build_assistant_graph(
             classifier=model,
             general_model=FakeModel('unused'),
-            assistant_model=FakeModel('unused'),
-            service=FakeService(),
             intent_router=router,
         )
         state = await graph.ainvoke(_state('你好'))
@@ -213,21 +224,23 @@ def test_hybrid_jev_router_drives_graph_end_to_end() -> None:
         )
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = build_intent_classifier(
-                config, registry=DomainRegistry.default(), jev_client=client,
+                config, registry=default_domain_registry(), jev_client=client,
             )
-            router = AssistantIntentRouter(classifier)
+            router = AssistantIntentRouter(classifier, slot_extractor=extract_claim_slots)
             graph = build_assistant_graph(
                 classifier=FakeModel('{"intent":"一般咨询","confidence":0.5}'),
                 general_model=FakeModel('unused'),
-                assistant_model=FakeModel('unused'),
-                service=FakeService(),
+                domain_registry=default_domain_registry(),
+                capabilities=_claims_capabilities(FakeService(), FakeModel('unused')),
                 intent_router=router,
             )
             state = await graph.ainvoke(_state('帮我查一下保单 POL-2024-001 还有效吗？'))
             await classifier.aclose()
 
         assert state['intent'] == '保单查询'
-        assert state['policy_id'] == 'POL-2024-001'
+        assert state['slots']['policy_id'] == 'POL-2024-001'
+        # 保单查询落点是理赔域注册的能力，不是内核里的意图字符串。
+        assert (state['domain'], state['capability']) == ('claims', 'policy_query')
         assert any('POL-2024-001' in event.get('content', '') for event in state['events'])
         classification = next(event['trace'] for event in state['events']
                               if event.get('trace', {}).get('node') == 'classification'
@@ -239,18 +252,22 @@ def test_hybrid_jev_router_drives_graph_end_to_end() -> None:
 
 
 def test_active_domain_from_history() -> None:
+    """领域归属从清单反查；落点是内核内置能力的意图不算"仍在讨论"。"""
+    registry = default_domain_registry()
     history = [
         ChatTurn(role='user', content='我的车被追尾了'),
         ChatTurn(role='assistant', content='请先报案', intent='理赔报案'),
     ]
-    assert active_domain_from_history(history) == 'claims'
+    assert active_domain_from_history(history, registry) == 'claims'
     assert active_domain_from_history([
         ChatTurn(role='assistant', content='好的', intent='投资咨询'),
-    ]) == 'investment'
+    ], registry) == 'investment'
     assert active_domain_from_history([
         ChatTurn(role='assistant', content='好的', intent='一般咨询'),
-    ]) is None
-    assert active_domain_from_history([]) is None
+    ], registry) is None
+    assert active_domain_from_history([], registry) is None
+    # 没有清单（内核自建 fallback）时不再猜测领域，避免把无关会话粘在旧领域上。
+    assert active_domain_from_history(history) is None
 
 
 class FakeIntentSettings:
@@ -327,3 +344,23 @@ def test_http_stream_uses_wired_router(monkeypatch) -> None:  # noqa: ANN001 - p
         assert intent_event['intent'] == '一般咨询'
         assert intent_event['intent_engine'] == 'llm'
         assert any('跨领域意图路由器' in prompt for prompt in model.system_prompts)
+
+
+def test_composite_slot_extractor_dispatches_by_domain() -> None:
+    """多领域各自注册槽位抽取器时按 RouteDecision.domain 分派，不互相覆盖。"""
+    def claims_slots(decision, question, turns):  # noqa: ANN001, ARG001 - 测试替身
+        return {'policy_id': 'POL-1'}
+
+    def finance_slots(decision, question, turns):  # noqa: ANN001, ARG001 - 测试替身
+        return {'invoice_no': 'INV-9'}
+
+    extract = composite_slot_extractor({'claims': claims_slots, 'finance': finance_slots})
+    assert extract(RouteDecision(domain='claims', intent='保单查询', confidence=1.0), '', []) == {
+        'policy_id': 'POL-1'
+    }
+    assert extract(RouteDecision(domain='finance', intent='票据查询', confidence=1.0), '', []) == {
+        'invoice_no': 'INV-9'
+    }
+    # 未注册抽取器的领域返回空槽位，而不是误用其他领域的规则。
+    assert extract(RouteDecision(domain='general', intent='一般咨询', confidence=1.0), '', []) == {}
+    assert composite_slot_extractor({}) is None

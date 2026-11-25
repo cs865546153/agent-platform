@@ -1,12 +1,12 @@
-"""对话图适配层：把工作台请求映射为 IntentRequest，并把 RouteDecision 收敛成工作台意图。
+"""对话图适配层：把工作台请求映射为 IntentRequest，并把 RouteDecision 收敛为槽位。
 
-`agent_core/intent` 只依赖公共契约，不认识 FastAPI 或工作台的请求模型；
-本模块是主程序（`agents/assistant_agent.py`）接入 IntentRouter 的唯一粘合层。
+`agent_core/intent` 只依赖公共契约，不认识 FastAPI、工作台请求模型，
+也不内置任何业务字段形态（保单号、案件号等）。领域专属的槽位兜底抽取
+由装配层通过 ``slot_extractor`` 注入，本模块只负责协议转换。
 """
 from __future__ import annotations
 
-import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,19 +14,21 @@ from .contracts import IntentClassifier, IntentRequest, RouteDecision, Turn
 
 HISTORY_LIMIT = 12
 ATTACHMENT_LIMIT = 6
-# 保单号形态：字母前缀 + 数字（POL-2024-001 / POL2024001）；仅在「保单查询」意图下兜底抽取。
-# JEV 只输出领域与意图，不返回槽位，因此保单号仍需本地正则补齐。
-POLICY_ID_PATTERN = re.compile(r"\b[A-Za-z]{2,6}[-_]?\d{2,6}[-_]?\d{2,6}\b")
-POLICY_SLOT_KEYS = ("policy_id", "policyid", "保单号", "保单编号")
+
+# 槽位抽取器签名：接收路由决策、当前问题、最近对话，返回槽位字典。
+SlotExtractor = Callable[[RouteDecision, str, list[Turn]], dict[str, str]]
 
 
 @dataclass(frozen=True)
 class AssistantRoute:
-    """主程序视角的路由结果：意图、置信度、保单号与完整决策。"""
+    """主程序视角的路由结果：意图、置信度、槽位与完整决策。
+
+    ``slots`` 是唯一的业务字段出口：键名由领域清单/槽位抽取器决定，内核不解释。
+    """
 
     intent: str
     confidence: float
-    policy_id: str | None
+    slots: dict[str, str]
     decision: RouteDecision
 
 
@@ -37,11 +39,11 @@ class AssistantIntentRouter:
         self,
         classifier: IntentClassifier,
         *,
-        policy_intents: frozenset[str] = frozenset({"保单查询"}),
+        slot_extractor: SlotExtractor | None = None,
     ) -> None:
         self.classifier = classifier
-        # 允许领域清单声明哪些意图需要兜底抽取保单号；默认兼容旧行为。
-        self.policy_intents = policy_intents
+        # 领域插件声明的槽位兜底抽取；不注入时内核不做任何业务字段抽取。
+        self.slot_extractor = slot_extractor
 
     @property
     def engine_label(self) -> str:
@@ -81,10 +83,11 @@ class AssistantIntentRouter:
             attachments=file_names,
         )
         decision = await self.classifier.classify(request)
+        slots = self.slot_extractor(decision, question, turns) if self.slot_extractor else {}
         return AssistantRoute(
             intent=decision.intent,
             confidence=decision.confidence,
-            policy_id=self._policy_id(decision, question, turns),
+            slots=slots,
             decision=decision,
         )
 
@@ -93,20 +96,6 @@ class AssistantIntentRouter:
         name = getattr(item, "file_name", None)
         return str(name or "attachment")[:255]
 
-    def _policy_id(self, decision: RouteDecision, question: str, turns: list[Turn]) -> str | None:
-        """优先用路由槽位，其次在声明了保单查询的意图下从问题与历史中兜底抽取。"""
-        for key in POLICY_SLOT_KEYS:
-            value = decision.slots.get(key)
-            if value:
-                return str(value)[:64]
-        if decision.intent not in self.policy_intents:
-            return None
-        recent_user_text = "\n".join(
-            [question, *(turn.content for turn in reversed(turns) if turn.role == "user")]
-        )
-        match = POLICY_ID_PATTERN.search(recent_user_text)
-        return match.group(0)[:64] if match else None
-
     async def aclose(self) -> None:
         """关闭底层引擎持有的 HTTP 客户端（JEV 使用 httpx.AsyncClient）。"""
         close = getattr(self.classifier, "aclose", None)
@@ -114,4 +103,4 @@ class AssistantIntentRouter:
             await close()
 
 
-__all__ = ["AssistantIntentRouter", "AssistantRoute"]
+__all__ = ["AssistantIntentRouter", "AssistantRoute", "SlotExtractor"]

@@ -20,10 +20,10 @@ from typing import Any
 
 import httpx
 
-from .contracts import IntentRequest, RouteDecision
+from .contracts import INTENT_LOGGER_NAME, IntentRequest, RouteDecision
 from .registry import DomainRegistry
 
-LOGGER = logging.getLogger("claims.intent")
+LOGGER = logging.getLogger(INTENT_LOGGER_NAME)
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 

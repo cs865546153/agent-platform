@@ -6,13 +6,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .contracts import IntentClassifier, RouteDecision
+from .contracts import INTENT_LOGGER_NAME, IntentClassifier, RouteDecision
 from .hybrid import HybridIntentClassifier
 from .jev import JevIntentClassifier
 from .llm import LLMIntentClassifier, LLMTranslator
 from .registry import DomainRegistry
 
-LOGGER = logging.getLogger("claims.intent")
+LOGGER = logging.getLogger(INTENT_LOGGER_NAME)
 
 # 预设：
 #   shadow  = LLM 主路由 + JEV 影子（默认，中文安全）
@@ -45,10 +45,13 @@ class IntentConfig:
 
     @classmethod
     def from_settings(cls, settings: Any = None) -> "IntentConfig":
-        if settings is None:
-            from settings import Settings
+        """从应用配置对象解析意图引擎参数。
 
-            settings = Settings()
+        ``agent_core`` 不反向依赖上层配置模块：调用方（app.py / 评测脚本）
+        应显式传入 Settings 实例；未传时返回纯默认值，不隐式读环境变量。
+        """
+        if settings is None:
+            return cls()
         engine = str(getattr(settings, "intent_engine", "shadow") or "shadow").lower()
         preset = PRESETS.get(engine, PRESETS["shadow"])
 
@@ -76,13 +79,12 @@ class IntentConfig:
         )
 
 
-def _default_mask(value: Any) -> Any:
-    """复用现有 PII 脱敏；导入失败时保持原值，便于独立使用。"""
-    try:
-        from agents.middleware_audit import mask_pii
-    except Exception:  # noqa: BLE001
-        return value
-    return mask_pii(value)
+def _identity(value: Any) -> Any:
+    """内核默认不脱敏；生产装配层必须显式注入 ``mask_pii``。
+
+    ``agent_core`` 不 import ``agents.middleware_audit``，避免下层依赖上层。
+    """
+    return value
 
 
 def build_intent_classifier(
@@ -95,10 +97,15 @@ def build_intent_classifier(
     mask: Callable[[Any], Any] | None = None,
     on_decision: Callable[[RouteDecision], None] | None = None,
 ) -> HybridIntentClassifier:
-    """按配置构建分类器；缺少 JEV key 时按角色降级而不是整体失败。"""
+    """按配置构建分类器；缺少 JEV key 时按角色降级而不是整体失败。
+
+    所有外部依赖（领域清单、LLM 模型、PII 脱敏）都由装配层注入，
+    本模块只做纯组装，不 import ``settings`` / ``config`` / ``agents``。
+    """
     cfg = config or IntentConfig.from_settings()
+    # 未显式传清单时用回退清单（仅 general）；完整清单应由装配层从插件聚合后传入。
     domains = registry or DomainRegistry.default()
-    effective_mask = mask or _default_mask
+    effective_mask = mask or _identity
 
     roles = {cfg.primary, cfg.fallback, cfg.shadow}
     needs_llm = cfg.translate_to_english or "llm" in roles
@@ -106,9 +113,10 @@ def build_intent_classifier(
     llm: LLMIntentClassifier | None = None
     if needs_llm:
         if resolved_llm_model is None:
-            from config import get_model
-
-            resolved_llm_model = get_model("classification")
+            raise ValueError(
+                "需要 LLM 意图引擎但未注入 llm_model；"
+                "装配层应传 get_model('classification') 或自定义分类模型"
+            )
         llm = LLMIntentClassifier(
             registry=domains,
             model=resolved_llm_model,

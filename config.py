@@ -1,4 +1,4 @@
-"""理赔 Agent 配置与模型工厂。"""
+"""模型工厂与任务档位：与具体业务领域无关的共享配置。"""
 
 import os
 from dataclasses import dataclass
@@ -115,12 +115,18 @@ TASK_PROFILES: Final[dict[str, TaskProfile]] = {
     "human_review": TaskProfile("plus", 0.2, 2000),
     "customer_service": TaskProfile("plus", 0.6, 1000, top_p=0.9, response_format="text"),
     "status_query": TaskProfile("flash", 0.2, 300, response_format="text"),
+    "fallback": TaskProfile("flash", 0.2, 500, response_format="text"),
+}
+
+# 示例领域档位：仅随示例投资领域提供，原创业务可整段删除。
+# 新领域请用 register_task_profile() 在插件装配期注册，不必修改本文件。
+EXAMPLE_TASK_PROFILES: Final[dict[str, TaskProfile]] = {
     "investment_advice": TaskProfile("plus", 0.4, 1800, top_p=0.9, response_format="text"),
     "investment_risk": TaskProfile("max", 0.2, 1200),
     "investment_suitability": TaskProfile("plus", 0.1, 800),
     "investment_trade": TaskProfile("max", 0.1, 1200),
-    "fallback": TaskProfile("flash", 0.2, 500, response_format="text"),
 }
+TASK_PROFILES.update(EXAMPLE_TASK_PROFILES)
 
 
 def _task_model(task: str, profile: TaskProfile) -> ChatOpenAI:
@@ -142,6 +148,18 @@ MODEL_ROUTING: Final[dict[str, ChatOpenAI]] = {
 }
 
 
+def register_task_profile(task: str, profile: TaskProfile) -> None:
+    """领域插件在装配期注册自己的任务档位，无需修改共享配置。
+
+    ``get_model(task)`` 与 ``tools.llm_calls`` 都会立即看到新档位；
+    重复注册显式报错，避免不同插件悄悄覆盖彼此的模型参数。
+    """
+    if task in TASK_PROFILES:
+        raise ValueError(f"任务档位重复注册：{task}")
+    TASK_PROFILES[task] = profile
+    MODEL_ROUTING[task] = _task_model(task, profile)
+
+
 def get_model(task: str) -> ChatOpenAI:
     """获取任务模型；未知任务显式报错，不自动降级判责。"""
     if task not in MODEL_ROUTING:
@@ -149,7 +167,7 @@ def get_model(task: str) -> ChatOpenAI:
     return MODEL_ROUTING[task]
 
 
-class ClaimLLMFactory:
+class LLMFactory:
     """四档模型缓存工厂，返回ChatOpenAI原生同步、异步、流式和批量接口。"""
     @staticmethod
     @lru_cache(maxsize=32)
@@ -178,3 +196,7 @@ class ClaimLLMFactory:
     @property
     def vision_model(self) -> ChatOpenAI:
         return self.create('vision')
+
+
+# 兼容旧名：历史教学/业务模块仍引用 ClaimLLMFactory；新代码请用领域无关的 LLMFactory。
+ClaimLLMFactory = LLMFactory

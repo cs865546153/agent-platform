@@ -19,13 +19,27 @@ class DomainRegistry:
 
     def __init__(self, domains: Iterable[DomainManifest] = ()) -> None:
         self._domains: dict[str, DomainManifest] = {}
+        # 意图名 → 领域名。JEV / LLM 引擎返回的是扁平意图名，重名会静默歧义。
+        self._intent_owners: dict[str, str] = {}
         for manifest in domains:
             self.register(manifest)
 
     def register(self, manifest: DomainManifest) -> None:
         if manifest.name in self._domains:
             raise ValueError(f"领域重复注册：{manifest.name}")
+        for spec in manifest.intents:
+            owner = self._intent_owners.get(spec.name)
+            if owner is not None and owner != manifest.name:
+                raise ValueError(
+                    f"意图「{spec.name}」同时由领域 {owner} 与 {manifest.name} 声明："
+                    "路由结果只有意图名，重名无法判定归属，请改名或归并领域"
+                )
+            self._intent_owners[spec.name] = manifest.name
         self._domains[manifest.name] = manifest
+
+    def intent_owner(self, intent: str) -> str | None:
+        """意图名归属的领域；未注册返回 ``None``。"""
+        return self._intent_owners.get(intent)
 
     def get(self, name: str) -> DomainManifest:
         try:
@@ -74,8 +88,8 @@ class DomainRegistry:
         ``DomainRegistry.from_yaml()``），则把 fallback 中未被插件覆盖的领域补齐——
         这样没有对应插件的领域（例如助手图内分流的 general）仍可被意图路由识别。
 
-        插件声明与 fallback 不得同名却内容不同（避免两份事实源悄悄分叉）；
-        若插件未声明某领域而 fallback 有，则以 fallback 为准。
+        插件声明与 fallback 同名时内容必须完全一致，否则抛 ``ValueError``
+        （避免两份事实源悄悄分叉）；若插件未声明某领域而 fallback 有，则以 fallback 为准。
         """
         registry = cls()
         for plugin in plugins:
@@ -90,6 +104,15 @@ class DomainRegistry:
             for name in fallback.names():
                 if name not in registry.names():
                     registry.register(fallback.get(name))
+                    continue
+                # 同名必须内容一致，否则两份事实源会悄悄分叉：改了插件 manifest
+                # 却忘改 YAML（或反过来）时，运行时"插件优先"会静默忽略其中一份。
+                declared = registry.get(name)
+                if declared.model_dump() != fallback.get(name).model_dump():
+                    raise ValueError(
+                        f"领域 {name} 同时由插件与 fallback 声明但内容不一致："
+                        "请以插件 manifest 为唯一事实源，或让两份清单完全一致"
+                    )
         return registry
 
 

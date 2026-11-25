@@ -15,7 +15,7 @@
 
 个人学习资料（`My_Study/`）与培训实现追踪清单已迁至工作区根目录 `../teaching-archive/`，不属于模板运行时；下文个别历史说明中的 `My_Study/Python/` 指该归档目录内的学习环境。
 
-**当前验证基线（2026-11-24 模板化重构后）**：`196 passed, 1 skipped`（原 188 + 3 条领域可插拔 + 5 条意图路由可插拔契约测试），覆盖率约 83%；跳过项为需要真实 Milvus 的集成测试。`bash scripts/start_mac.sh` 启动后 `/health`、`/ready`、首页与 19 个路由均正常。架构见 [Architecture.md](Architecture.md)，模板化说明见 [TEMPLATE.md](TEMPLATE.md)（培训实现追踪清单已归档至 `../teaching-archive/`），Agent 工作约定见 [AGENTS.md](AGENTS.md)。
+**当前验证基线（2026-11-25 对话编排可插拔化后）**：`222 passed, 1 skipped`（领域可插拔 + 意图路由可插拔 + 能力分派 + 内核边界门禁契约测试），覆盖率约 83%；跳过项为需要真实 Milvus 的集成测试。`bash scripts/start_mac.sh` 启动后 `/health`、`/ready`、首页与 19 个路由均正常。架构见 [Architecture.md](Architecture.md)，模板化说明见 [TEMPLATE.md](TEMPLATE.md)（培训实现追踪清单已归档至 `../teaching-archive/`），Agent 工作约定见 [AGENTS.md](AGENTS.md)。
 
 主要链路：
 
@@ -304,7 +304,7 @@ docker compose up -d --build
 
 Apple Silicon 上应用容器为 arm64。若 `--profile infra` 的 Milvus 拉不到 arm64 镜像，可对这些服务单独使用 `--platform linux/amd64`，或只启动 `app` 并指向外部 Milvus。
 
-> 本机验证（macOS 14.8.2 / Apple Silicon / Python 3.15.1）：`pip check` 无冲突，`pytest` 为 **196 passed, 1 skipped**（跳过项需真实 Milvus），`uvicorn app:app` 启动后 `/health`、`health_check.py` 均通过。国内网络安装依赖时请使用上面的清华镜像。
+> 本机验证（macOS 14.8.2 / Apple Silicon / Python 3.15.1）：`pip check` 无冲突，`pytest` 为 **222 passed, 1 skipped**（跳过项需真实 Milvus），`uvicorn app:app` 启动后 `/health`、`health_check.py` 均通过。国内网络安装依赖时请使用上面的清华镜像。
 
 ## 结构与职责
 
@@ -316,7 +316,7 @@ claims-ai-agent/
 ├── claims_agent.py             # 理赔端到端入口与离线演示
 ├── confidence_system.py        # 置信度公共入口
 ├── logging_setup.py            # 日志、请求 ID、轮转与脱敏
-├── monitoring.py               # Prometheus 业务指标
+├── monitoring.py               # Prometheus 指标（METRIC_PREFIX 可配，插件可注册自己的指标）
 ├── health_check.py             # HTTP 健康与状态机验证
 ├── requirements.txt            # 主要依赖版本锁定（完整冻结见 requirements-py315.lock.txt）
 ├── .env.example                # 环境模板，不包含真实密钥
@@ -379,9 +379,13 @@ agents/tools/prompts/models/tests及新增Python包均有`__init__.py`。
 
 ### 方案 A（已实现）：无状态多节点图
 
-- 图节点：`classify`（IntentRouter 意图路由）→ 条件路由 → `policy_query` / `material_gate` → `follow_up` / `formal_review`
+- 图节点：`classify`（IntentRouter 意图路由 + 领域清单校验）→ 条件路由 → 按意图对应的
+  `capability` 分派处理器；内核只内置 `answer`（通用问答）和 `guard`（高风险拦截），
+  `policy_query` / `claim_workflow` / `claims_answer` / `investment_answer` / `trade_gate`
+  等落点由各领域插件在 `domains/*/assistant_handlers.py` 注册，新增领域不改图代码
 - 意图路由由 `app.py` 装配时构建一次（`build_assistant_intent_router`），领域清单从插件
-  `manifest.yaml` 聚合（`configs/domains.yaml` 仅补齐无插件领域）；可用
+  `manifest.yaml` 聚合（`configs/domains.yaml` 已瘦身为只含 general 的回退清单）；
+  领域槽位抽取器由插件经 `AppContext.slot_extractors` 注入；可用
   `create_app(intent_router=...)` 显式注入自定义 router；代码默认 `shadow`，
   当前 `.env` 为 `hybrid`：JEV 主路由 + LLM 兜底；路由异常时回落 `assistant_agent`
   内置分类模型，SSE 不中断
@@ -420,7 +424,7 @@ agents/tools/prompts/models/tests及新增Python包均有`__init__.py`。
 | PyYAML | 6.0.3 | 6.0.3（纯 Python wheel） | 官方无 cp315 wheel，见 `vendor/` |
 | ruff | 0.9.10 | 不变 | 自带 `py3-none-win_amd64` wheel |
 
-> 验证结果：`pip check` 无依赖冲突；本轮测试集在 macOS 上为 **196 passed, 1 skipped**（跳过的是需要真实 Milvus 服务的集成用例），Windows 未在本轮复测。
+> 验证结果：`pip check` 无依赖冲突；本轮测试集在 macOS 上为 **222 passed, 1 skipped**（跳过的是需要真实 Milvus 服务的集成用例），Windows 未在本轮复测。
 
 Windows（PowerShell）：
 
@@ -544,7 +548,7 @@ bash scripts/start_mac.sh --no-reload  # 关闭热重载
 | POST /api/documents/analyze | 内存解析并识别最多 6 份理赔单证 |
 | POST /api/assistant/stream | 结合案件、单证和历史上下文的流式问答（理赔/投资/通用） |
 
-请求支持 description 或 claim_text，以及可选 policy_id、amount。理赔返回的是审核建议，不执行支付。SQLite 检查点保存在 `.data/checkpoints.sqlite`，重启可恢复。拒赔需授权人工提供条款依据；低置信度、证据不足和大额转人工。生产必须配置 `CLAIMS_API_KEY` 和 `REVIEWER_API_KEY`；示例不支持多租户行级权限，也不能直接横向扩容。
+请求支持 description 或 claim_text，以及可选 policy_id、amount。理赔返回的是审核建议，不执行支付。SQLite 检查点保存在 `.data/checkpoints.sqlite`，重启可恢复。拒赔需授权人工提供条款依据；低置信度、证据不足和大额转人工。生产必须配置 `API_KEY`（兼容旧名 `CLAIMS_API_KEY`）和 `REVIEWER_API_KEY`；示例不支持多租户行级权限，也不能直接横向扩容。
 
 ## 接入层中间件（认证 / 限流 / 审计）
 
@@ -557,7 +561,7 @@ CORS → RequestID → 认证 → 请求体上限 → 限流 → 审计 → 业�
 | 能力 | 行为 | 配置 |
 | --- | --- | --- |
 | 请求 ID | 接受合法 `X-Request-ID`（8–64 位 `[A-Za-z0-9._-]`），否则生成 UUID；响应头回传，日志与审计可串联 | — |
-| 认证 | `/api/*` 除 `/api/demo/*` 外由接入层校验 `X-API-Key`（未配置时开发放行，生产启动即失败）；审核类接口另需 `X-Reviewer-Key` | `CLAIMS_API_KEY`、`REVIEWER_API_KEY` |
+| 认证 | `/api/*` 除 `/api/demo/*` 外由接入层校验 `X-API-Key`（未配置时开发放行，生产启动即失败）；Depends 版与中间件共用 `agent_core/security.resolve_api_key()`；审核类接口另需 `X-Reviewer-Key` | `API_KEY`（优先）/ `CLAIMS_API_KEY`（兼容）、`REVIEWER_API_KEY` |
 | 请求体上限 | 超过上限直接 413，不进入业务 | `HTTP_MAX_BODY_BYTES`（默认 64MB） |
 | 限流 | 按「身份 + 来源 IP + 接口类别」分桶，流式与单证接口独立配额；超限返回 429 + `Retry-After` | `HTTP_RATE_LIMIT_PER_MINUTE`（1200）、`HTTP_STREAM_RATE_LIMIT_PER_MINUTE`（120）、`HTTP_DOCUMENT_RATE_LIMIT_PER_MINUTE`（120）、`HTTP_RATE_LIMIT_ENABLED` |
 | 审计 | 每条业务请求落库：request_id、身份、状态码、耗时、脱敏入参、IP 哈希；RAG 请求额外记录 `details.retrieval`（各路命中、融合数、重排候选、降级标志、最终引用）；只追加 + 哈希链，可检测篡改 | `CLAIMS_AUDIT_DB`（默认 `.data/audit.sqlite`，测试用 `:memory:`） |
@@ -729,7 +733,7 @@ curl -s http://127.0.0.1:8001/api/rag/answer \
 - 意图路由已接入 `/api/assistant/stream`：JEV / LLM / Hybrid / Shadow 可切换，代码默认 shadow，当前 `.env` 为 hybrid；
 - BGE-M3 + BGE-Reranker 已启用，正常检索返回 `rerank_fallback=false`；
 - 索引已建成：`investment_wiki` 约 55 个 chunk，`knowledge_general` 约 3 个 chunk；
-- `196 passed, 1 skipped`，覆盖率约 83%；审计哈希链、请求 ID、PII 脱敏和 RAG 诊断字段可用；
+- `222 passed, 1 skipped`，覆盖率约 83%；审计哈希链、请求 ID、PII 脱敏和 RAG 诊断字段可用；
 - 线上 `/ai/` 已通过 nginx Basic Auth 部署，`app` 容器只监听 `127.0.0.1:8001`。
 
 **仍需完善**
@@ -796,7 +800,7 @@ docker run --rm \
 
 ```ini
 APP_ENV=development
-CLAIMS_API_KEY=
+API_KEY=
 REVIEWER_API_KEY=
 EMBEDDING_BASE_URL=http://embed:8010/v1
 RERANK_BASE_URL=http://embed:8010/v1

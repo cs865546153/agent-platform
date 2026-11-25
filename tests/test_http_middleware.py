@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agents.audit_store import AuditStore
+from agent_core.security import resolve_api_key
 from app import create_app
 
 
@@ -13,6 +14,7 @@ from app import create_app
 def make_client(monkeypatch: pytest.MonkeyPatch) -> Iterator[callable]:
     """按用例构造独立应用，避免模块级 app 的审计库互相干扰。"""
     monkeypatch.setenv('APP_ENV', 'development')
+    monkeypatch.delenv('API_KEY', raising=False)
     monkeypatch.delenv('CLAIMS_API_KEY', raising=False)
     monkeypatch.delenv('REVIEWER_API_KEY', raising=False)
     clients: list[TestClient] = []
@@ -51,6 +53,33 @@ def test_invalid_request_id_is_replaced(make_client) -> None:
 def test_api_key_required_when_configured(make_client, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv('CLAIMS_API_KEY', 'k' * 24)
     client = make_client()
+    assert client.post('/api/claims/process', json={'claim_id': 'C-1', 'description': 'x'}).status_code == 401
+    ok = client.post('/api/claims/process', json={'claim_id': 'C-2', 'description': 'x'},
+                     headers={'X-API-Key': 'k' * 24})
+    assert ok.status_code == 200
+
+
+def test_resolve_api_key_prefers_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """API_KEY 是首选，CLAIMS_API_KEY 仅作旧部署兼容。"""
+    monkeypatch.setenv('API_KEY', 'primary-key')
+    monkeypatch.setenv('CLAIMS_API_KEY', 'legacy-key')
+    assert resolve_api_key() == 'primary-key'
+    monkeypatch.delenv('API_KEY')
+    assert resolve_api_key() == 'legacy-key'
+
+
+def test_api_key_alias_unified_across_layers(make_client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """只配 API_KEY 时，Depends 认证与接入层中间件必须同时生效。
+
+    回归点：修复前 app.py 内联 authenticate 只读 CLAIMS_API_KEY，
+    导致 /metrics、/api/rag/*、/api/assistant/stream 开发放行、生产 503。
+    """
+    monkeypatch.setenv('API_KEY', 'k' * 24)
+    client = make_client()
+    # /metrics 不以 /api/ 开头，只受 Depends 版认证，能单独验证 app.py 层。
+    assert client.get('/metrics').status_code == 401
+    assert client.get('/metrics', headers={'X-API-Key': 'k' * 24}).status_code == 200
+    # /api/ 前缀由接入层中间件判定 actor 并拦截。
     assert client.post('/api/claims/process', json={'claim_id': 'C-1', 'description': 'x'}).status_code == 401
     ok = client.post('/api/claims/process', json={'claim_id': 'C-2', 'description': 'x'},
                      headers={'X-API-Key': 'k' * 24})

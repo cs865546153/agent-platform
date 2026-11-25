@@ -9,7 +9,7 @@ import pytest
 
 from agent_core.intent.contracts import IntentRequest, Turn
 from agent_core.intent.jev import JevError, JevIntentClassifier
-from agent_core.intent.registry import DomainRegistry
+from domains.registry import default_domain_registry
 
 
 def _response(
@@ -62,7 +62,7 @@ def test_jev_payload_and_parsing() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -100,7 +100,7 @@ def test_jev_masks_pii_before_sending() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -127,7 +127,7 @@ def test_jev_uses_translator_and_warns_without_it() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -142,7 +142,7 @@ def test_jev_uses_translator_and_warns_without_it() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -161,7 +161,7 @@ def test_jev_http_error_raises() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -186,7 +186,7 @@ def test_jev_retries_529_then_succeeds() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -213,7 +213,7 @@ def test_jev_retry_exhausted_on_529() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -239,7 +239,7 @@ def test_jev_does_not_retry_4xx() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -265,7 +265,7 @@ def test_jev_retry_count_is_capped() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -296,7 +296,7 @@ def test_jev_corrects_unknown_domain_and_cross_domain_intent() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -323,7 +323,7 @@ def test_jev_low_confidence_needs_clarification() -> None:
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = JevIntentClassifier(
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 base_url="https://example.test/jev",
                 api_key="test-key",
                 client=client,
@@ -340,7 +340,7 @@ def test_jev_low_confidence_needs_clarification() -> None:
 def test_jev_requires_api_key() -> None:
     with pytest.raises(ValueError):
         JevIntentClassifier(
-            registry=DomainRegistry.default(),
+            registry=default_domain_registry(),
             base_url="https://example.test/jev",
             api_key="",
         )

@@ -8,6 +8,23 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RiskLevel = Literal["low", "medium", "high"]
 DomainMode = Literal["conversation", "case"]
+# 能力名是"对话编排处理器"的键：内核按名字分派，不认识任何领域概念。
+CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*$"
+
+# 意图路由子系统的统一 logger 命名空间：同一个子系统的日志必须落在一个名字下，
+# 否则按 logger 名做 grep / 告警会漏掉 jev 与 hybrid 的记录。
+INTENT_LOGGER_NAME = "agent_core.intent"
+
+
+def fallback_capability(mode: str, risk: str) -> str:
+    """意图未声明 ``capability`` 时由 ``mode`` / ``risk`` 推导内核内置能力。
+
+    ``case`` 模式与 ``high`` 风险意图先进人工确认门（guard），其余走直接回答
+    （answer）。这样清单里已声明的字段真正驱动分流，而不是在图代码里比字符串。
+    """
+    if mode == "case" or risk == "high":
+        return "guard"
+    return "answer"
 
 
 class IntentSpec(BaseModel):
@@ -22,10 +39,18 @@ class IntentSpec(BaseModel):
     examples: list[str] = Field(default_factory=list, max_length=20)
     risk: RiskLevel = "low"
     mode: DomainMode = "conversation"
+    # 命中该意图时调用的编排能力名，由领域插件在装配期注册实现。
+    # 留空时回落到内核内置能力（见 ``fallback_capability``）。
+    capability: str | None = Field(default=None, pattern=CAPABILITY_PATTERN, max_length=64)
 
     def criteria_text(self) -> str:
         """返回给意图引擎的意图描述，优先英文。"""
         return self.description_en or self.description
+
+    @property
+    def resolved_capability(self) -> str:
+        """该意图落到对话图的编排能力名（未声明时为内核内置能力）。"""
+        return self.capability or fallback_capability(self.mode, self.risk)
 
 
 class DomainManifest(BaseModel):
@@ -39,12 +64,19 @@ class DomainManifest(BaseModel):
     version: str = Field(default="1.0.0", max_length=32)
     intents: list[IntentSpec] = Field(min_length=1)
     capabilities: list[str] = Field(default_factory=list, max_length=32)
+    # 领域专属的意图判别边界，拼进内核的兜底分类提示词；内核不写死任何领域话术。
+    classification_hint: str | None = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
     def unique_intents(self) -> "DomainManifest":
         names = [item.name for item in self.intents]
         if len(names) != len(set(names)):
             raise ValueError(f"领域 {self.name} 存在重复意图")
+        # 意图绑定的能力必须在领域声明的能力集合里，否则拼错的capability会静默退回内核兜底。
+        declared = set(self.capabilities)
+        missing = sorted({item.capability for item in self.intents if item.capability} - declared)
+        if missing:
+            raise ValueError(f"领域 {self.name} 的意图绑定了未声明的能力：{'、'.join(missing)}")
         return self
 
     def criteria_text(self) -> str:
@@ -52,6 +84,11 @@ class DomainManifest(BaseModel):
 
     def intent(self, name: str) -> IntentSpec | None:
         return next((item for item in self.intents if item.name == name), None)
+
+    def capability_of(self, intent: str, *, default: str = "answer") -> str:
+        """该领域里某个意图绑定的编排能力；未注册的意图落回 ``default``。"""
+        spec = self.intent(intent)
+        return spec.resolved_capability if spec else default
 
 
 class Turn(BaseModel):

@@ -3,7 +3,7 @@
 新增一个业务领域只需实现 :class:`DomainPlugin` 并在 ``domains/registry.py`` 登记，
 无需修改内核（app.py / agent_core / 接入层）。领域插件可以声明：
 
-- ``build_services``：按配置装配领域服务（真实后端 / demo 后端）；
+- ``build_services``：按配置装配领域服务（真实后端 / demo 后端），并注册对话编排能力；
 - ``build_graphs``：在 lifespan 中基于 checkpointer 构建 LangGraph；
 - ``register_routes``：注册该领域专属的 HTTP 路由；
 - ``intent_manifest``：声明该领域的意图清单，供意图路由器识别（可选）；
@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from fastapi import FastAPI
+
+from agent_core.capabilities import AssistantCapabilities
 
 
 @dataclass
@@ -40,6 +42,12 @@ class AppContext:
     graphs: dict[str, Any] = field(default_factory=dict)
     rag: dict[str, Any] = field(default_factory=dict)
     models: dict[str, Any] = field(default_factory=dict)
+    # 领域插件在 build_services 时注册槽位兜底抽取器；内核只做协议转换，
+    # 不内置任何业务字段形态（如保单号正则）。
+    slot_extractors: dict[str, Any] = field(default_factory=dict)
+    # 领域插件注册的对话编排能力（能力名 → 对话图节点实现）。
+    # 内核按领域清单声明的能力名分派，未注册的能力回落内置 answer / guard。
+    capabilities: AssistantCapabilities = field(default_factory=AssistantCapabilities)
     intent_router: Any = None
     intent_registry: Any = None
 

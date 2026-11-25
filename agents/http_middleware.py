@@ -20,6 +20,7 @@ from typing import Any
 from starlette.datastructures import MutableHeaders
 
 from agents.middleware_audit import RateLimitMiddleware, mask_pii
+from agent_core.security import resolve_api_key, resolve_reviewer_key
 from logging_setup import request_id_var, retrieval_diagnostics_var
 
 LOGGER = logging.getLogger('claims.http')
@@ -188,8 +189,8 @@ class EnterpriseHttpMiddleware:
     def _authenticate(self, scope: dict[str, Any], path: str) -> str | tuple[int, str]:
         api_key = _header(scope, 'x-api-key')
         reviewer_key = _header(scope, 'x-reviewer-key')
-        expected = os.getenv('CLAIMS_API_KEY', '')
-        expected_reviewer = os.getenv('REVIEWER_API_KEY', '')
+        expected = resolve_api_key()
+        expected_reviewer = resolve_reviewer_key()
         production = os.getenv('APP_ENV') == 'production'
 
         actor = 'anonymous'

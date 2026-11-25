@@ -7,13 +7,14 @@ import time
 from collections.abc import Callable
 
 from .contracts import (
+    INTENT_LOGGER_NAME,
     IntentClassificationError,
     IntentClassifier,
     IntentRequest,
     RouteDecision,
 )
 
-LOGGER = logging.getLogger("claims.intent")
+LOGGER = logging.getLogger(INTENT_LOGGER_NAME)
 ERROR_TEXT_LIMIT = 200
 
 

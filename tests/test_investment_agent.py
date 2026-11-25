@@ -161,7 +161,7 @@ def test_assistant_routes_portfolio_diagnosis_to_investment_prompt() -> None:
             intent_model=model,
             general_model=model,
             assistant_model=model,
-            investment_model=model,
+            models={'investment_advice': model},
         )
     ) as client:
         response = client.post(
@@ -185,7 +185,7 @@ def test_assistant_blocks_direct_trade_execution() -> None:
             intent_model=model,
             general_model=model,
             assistant_model=model,
-            investment_model=model,
+            models={'investment_advice': model},
         )
     ) as client:
         response = client.post(
@@ -204,6 +204,52 @@ def test_assistant_blocks_direct_trade_execution() -> None:
         assert investment["output"]["executed"] is False
         assert investment["output"]["requires_human_review"] is True
         assert not model.stream_system_prompts
+
+
+def test_trade_gate_resumes_after_process_restart(tmp_path, monkeypatch) -> None:
+    """重启后取回 HITL 状态：恢复门控不能只依赖中断载荷。
+
+    LangGraph 在新进程里只重建 ``snapshot.next``（待执行节点），
+    ``tasks[].interrupts`` 是空的。若门控只看中断载荷，投资域的
+    ``/confirm`` 与 ``/review`` 会在重启后永远返回 409——案件状态还在，
+    但用户再也推不动它。这里把两条恢复入口都钉住。
+    """
+    monkeypatch.setenv("REVIEWER_API_KEY", "test-only-reviewer-key")
+    database = str(tmp_path / "checkpoints.db")
+    payload = {
+        "request_id": "INV-RESTART-001",
+        "question": "帮我买入这只基金",
+        "intent": "交易指令",
+        "risk_profile": "稳健型",
+        "product_id": "FUND-DEMO-001",
+        "amount": "10000",
+        "confirmed": False,
+    }
+    with TestClient(create_app(database=database)) as client:
+        first = client.post("/api/investment/process", json=payload)
+        assert first.status_code == 200
+        assert first.json()["requires_confirmation"] is True
+
+    with TestClient(create_app(database=database)) as client:
+        path = payload["request_id"]
+        # 幂等重放：同一请求再次 process 只回状态，不重跑图。
+        assert client.post("/api/investment/process", json=payload).json()[
+            "requires_confirmation"
+        ] is True
+        confirmed = client.post(f"/api/investment/{path}/confirm", json={"confirmed": True})
+        assert confirmed.status_code == 200, confirmed.text
+        assert confirmed.json()["requires_human_review"] is True
+        # 已过确认阶段，重复确认必须 409 而不是静默重放。
+        assert client.post(f"/api/investment/{path}/confirm", json={"confirmed": True}).status_code == 409
+        assert client.post(f"/api/investment/{path}/review", json={
+            "decision": "approve", "reviewer": "测试审批员", "reason": "重启恢复回归",
+        }).status_code == 403
+        approved = client.post(f"/api/investment/{path}/review", json={
+            "decision": "approve", "reviewer": "测试审批员", "reason": "重启恢复回归",
+        }, headers={"X-Reviewer-Key": "test-only-reviewer-key"})
+        assert approved.status_code == 200, approved.text
+        body = approved.json()
+        assert body["executed"] is False and body["decision"] == "review"
 
 
 def test_demo_investment_endpoint_returns_advice_and_trace() -> None:

@@ -11,13 +11,14 @@ from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 
 from agent_core.intent.contracts import (
+    INTENT_LOGGER_NAME,
     IntentClassificationError,
     IntentRequest,
     RouteDecision,
 )
 from agent_core.intent.factory import IntentConfig, build_intent_classifier
 from agent_core.intent.hybrid import HybridIntentClassifier
-from agent_core.intent.registry import DomainRegistry
+from domains.registry import default_domain_registry
 
 
 class FakeClassifier:
@@ -84,7 +85,7 @@ def test_low_confidence_uses_fallback() -> None:
 
 
 def test_low_confidence_logs_primary_decision(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.INFO, logger="claims.intent")
+    caplog.set_level(logging.INFO, logger=INTENT_LOGGER_NAME)
     hybrid = HybridIntentClassifier(
         primary=FakeClassifier(decision=_decision(confidence=0.55, needs_clarification=True)),
         fallback=FakeClassifier(decision=_decision(confidence=0.95)),
@@ -96,7 +97,7 @@ def test_low_confidence_logs_primary_decision(caplog: pytest.LogCaptureFixture) 
 
 
 def test_primary_error_logs_actual_message(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.INFO, logger="claims.intent")
+    caplog.set_level(logging.INFO, logger=INTENT_LOGGER_NAME)
     hybrid = HybridIntentClassifier(
         primary=FakeClassifier(error=RuntimeError("boom")),
         fallback=FakeClassifier(decision=_decision(confidence=0.92)),
@@ -205,7 +206,7 @@ def test_factory_builds_shadow_preset() -> None:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             classifier = build_intent_classifier(
                 config,
-                registry=DomainRegistry.default(),
+                registry=default_domain_registry(),
                 llm_model=FakeLLM(
                     json.dumps(
                         {"domain": "claims", "intent": "理赔报案", "confidence": 0.91},
@@ -230,7 +231,7 @@ def test_factory_drops_jev_shadow_without_key() -> None:
     config = IntentConfig.from_settings(NoKeySettings())
     classifier = build_intent_classifier(
         config,
-        registry=DomainRegistry.default(),
+        registry=default_domain_registry(),
         llm_model=FakeLLM(
             json.dumps(
                 {"domain": "claims", "intent": "理赔报案", "confidence": 0.91},
@@ -245,6 +246,6 @@ def test_factory_requires_key_for_jev_primary() -> None:
     with pytest.raises(ValueError):
         build_intent_classifier(
             IntentConfig(primary="jev", fallback=None, shadow=None, jev_api_key=""),
-            registry=DomainRegistry.default(),
+            registry=default_domain_registry(),
             llm_model=FakeLLM("{}"),
         )

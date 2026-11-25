@@ -3,7 +3,7 @@ import asyncio
 from collections.abc import Callable
 from decimal import Decimal
 import operator
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Final, TypedDict
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -98,23 +98,57 @@ def route_decision(state: ClaimState) -> str:
     return 'auto'
 
 
+EXPERT_ROLES: Final[tuple[str, ...]] = ('damage', 'risk', 'liability')
+# 审核路由结果的工作台文案；对话态与状态机共用，避免两处各写一份字典。
+DECISION_LABELS: Final[dict[str, str]] = {
+    'auto': '受理建议', 'review': '人工复核', 'investigate': '调查核实',
+}
+
+
+def degraded_opinion(role: str, error: str) -> dict[str, Any]:
+    """专家调用失败时的显式降级意见：转人工，不带分数。"""
+    return {'expert': role, 'recommendation': 'review', 'confidence': 0,
+            'risk_score': None, 'missing_information': ['专家调用未成功'], 'error': error}
+
+
+def aggregate_opinions(expert_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """把三专家意见汇总为 ``(最低置信度, 风险分)``；判责图与对话态共用同一口径。"""
+    opinions = {item.get('expert'): item for item in expert_results}
+    confidences = [float(item['confidence']) for item in expert_results if item.get('confidence') is not None]
+    return {
+        'opinions': opinions,
+        'confidence': min(confidences) if confidences else 0.0,
+        'risk_score': next((item.get('risk_score') for item in expert_results
+                            if item.get('expert') == 'risk'), None),
+    }
+
+
+async def run_experts(experts: Any, claim_data: dict[str, Any],
+                      policy_info: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """用判责子图跑三专家：对话态与状态机共用同一份扇出与聚合实现。"""
+    state = await experts.ainvoke({'claim_data': claim_data, 'policy_info': policy_info}, config=config)
+    results = state.get('expert_results', [])
+    summary = aggregate_opinions(results)
+    return {**summary, 'expert_results': results,
+            'confidence': state.get('confidence', summary['confidence']),
+            'risk_score': state.get('risk_score', summary['risk_score'])}
+
+
 def build_expert_graph(services: WorkflowServices) -> Any:
     """Send扇出及operator.add汇总，直接作为主图子图复用。"""
     graph = StateGraph(ClaimState)
     def dispatch(state: ClaimState) -> list[Send]:
         return [Send('expert', {'role': role, 'claim_data': state['claim_data'], 'policy_info': state['policy_info']})
-                for role in ('damage', 'risk', 'liability')]
+                for role in EXPERT_ROLES]
     async def expert(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         try:
             result = await services.expert(state['role'], state['claim_data'], state['policy_info'], config)
         except Exception as exc:
-            result = {'expert': state['role'], 'recommendation': 'review', 'confidence': 0,
-                      'risk_score': None, 'missing_information': ['专家调用未成功'], 'error': type(exc).__name__}
+            result = degraded_opinion(state['role'], type(exc).__name__)
         return {'expert_results': [result]}
     def aggregate(state: ClaimState) -> dict[str, Any]:
-        opinions = state['expert_results']
-        risk = next((item.get('risk_score') for item in opinions if item['expert'] == 'risk'), None)
-        return {'confidence': min(float(item['confidence']) for item in opinions), 'risk_score': risk}
+        summary = aggregate_opinions(state['expert_results'])
+        return {'confidence': summary['confidence'], 'risk_score': summary['risk_score']}
     graph.add_node('expert', expert)
     graph.add_node('aggregate', aggregate)
     graph.add_conditional_edges(START, dispatch, ['expert'])
