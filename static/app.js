@@ -1,6 +1,6 @@
 const state = {
   claimId: null, documents: [], history: [], pendingFiles: [], busy: false,
-  isDemo: false, materialRound: 0,
+  isDemo: false, materialRound: 0, clarifyRound: 0,
 };
 const $ = (id) => document.getElementById(id);
 
@@ -98,6 +98,7 @@ function selectFiles(files) {
     state.history = [];
     state.isDemo = false;
     state.materialRound = 0;
+    state.clarifyRound = 0;
     toast("已退出演示案件，将使用真实附件解析");
   }
   state.pendingFiles.push(...selected);
@@ -122,6 +123,7 @@ async function streamAnswer(question, newDocuments, article) {
     body: JSON.stringify({
       question, claim_id: state.claimId, documents: state.documents,
       history: state.history.slice(-12), material_round: state.materialRound,
+      round: state.clarifyRound,
     }),
   });
   answer.textContent = "";
@@ -130,6 +132,7 @@ async function streamAnswer(question, newDocuments, article) {
   let buffer = "";
   let detectedIntent = null;
   let materialStatus = null;
+  let clarificationStatus = null;
   let completed = false;
   while (true) {
     const { value, done } = await reader.read();
@@ -146,11 +149,16 @@ async function streamAnswer(question, newDocuments, article) {
         materialStatus = data.material_status;
         state.materialRound = data.material_round;
       }
+      if (data.clarification_status) {
+        clarificationStatus = data.clarification_status;
+        state.clarifyRound = clarificationStatus.round || 0;
+      }
       if (data.done) {
         completed = true;
         traceNode("output", "done", materialStatus === "incomplete" ? "等待用户继续上传" : "回答已完成");
         $("traceStatus").textContent = materialStatus === "incomplete"
           ? `等待补充 · 第 ${state.materialRound}/3 轮`
+          : clarificationStatus?.status === "asking" ? `等待澄清 · 第 ${state.clarifyRound}/3 轮`
           : materialStatus === "exhausted" ? "建议转人工" : "执行完成";
       }
       if (data.error) throw new Error(data.error);
@@ -165,6 +173,8 @@ async function streamAnswer(question, newDocuments, article) {
     scrollToBottom();
   }
   if (!completed) throw new Error("连接中断，回答未完成，请重试。");
+  // 本轮没有新的澄清追问，说明要素已补齐或话题已切换，重置轮次避免误耗尽。
+  if (!clarificationStatus) state.clarifyRound = 0;
   if (!answer.textContent) answer.textContent = "模型未返回有效内容，请稍后重试。";
   renderDocumentDetails(article.querySelector(".document-details"), newDocuments);
   state.history.push(
@@ -232,6 +242,7 @@ async function runDemoClaim(endpoint = "api/demo/claims/process") {
     state.history = [];
     state.isDemo = true;
     state.materialRound = 0;
+    state.clarifyRound = 0;
     traceNode("input", "done", `合成案件 ${data.claim.claim_id}`);
     setTraceParams("input", {source: "本地合成演示数据"}, data.claim);
     traceNode("documents", "done", `${data.documents.length} 份合成单证`);
@@ -301,6 +312,7 @@ $("newChat").addEventListener("click", () => {
   state.history = [];
   state.isDemo = false;
   state.materialRound = 0;
+  state.clarifyRound = 0;
   state.pendingFiles = [];
   renderPendingFiles();
   $("chatMessages").innerHTML = '<article class="message assistant"><div class="avatar" aria-hidden="true">智</div><div class="message-body"><div class="bubble"><p>新对话已开始。请描述你的理赔、投资或通用问题，也可以上传附件。</p></div></div></article>';
@@ -309,7 +321,8 @@ document.querySelectorAll(".quick-actions button").forEach((button) => button.ad
 
 const traceNames = {
   input: "接收消息", documents: "附件识别", classification: "多轮意图识别",
-  intent_router: "领域意图路由", domain_registry: "领域注册校验", domain_plugin: "领域插件",
+  intent_router: "领域意图路由", domain_registry: "领域注册校验", plan: "执行计划",
+  domain_plugin: "领域插件",
   route: "选择回答链路", claims: "理赔智能体", investment: "投资智能体",
   general: "通用基模", output: "返回回答",
   capability_state: "状态存储", capability_rag: "知识检索",
@@ -371,7 +384,7 @@ function resetTrace() {
   const loop = '<div class="trace-loop" aria-label="材料不足时回流补充">↶ 材料不足时回流上传并重新核查</div>';
   const claimDetail = `<section id="claimTraceDetail" class="claim-trace-detail"><header><strong>理赔状态机明细</strong><span>对话预审 / 正式核赔节点</span></header>${node("claim_intake")}${arrow}${node("claim_documents")}${loop}${node("claim_followup")}${arrow}${node("claim_policy")}${arrow}${expertRow}${arrow}${node("claim_confidence")}${arrow}${node("claim_decision")}</section>`;
   const investmentDetail = `<section id="investmentTraceDetail" class="trace-section inactive"><header><strong>投资智能体明细</strong><span>投顾问答 / 高风险交易案件</span></header>${node("investment_intake")}${arrow}${node("investment_context")}${arrow}${node("investment_rag")}${arrow}${node("investment_risk")}${arrow}${node("investment_decision")}${arrow}${node("investment_review")}${arrow}${node("investment_execute")}</section>`;
-  const platformDetail = `<section id="platformTraceDetail" class="trace-section"><header><strong>平台内核</strong><span>意图路由 / 领域注册 / 链路选择</span></header>${node("intent_router")}${arrow}${node("domain_registry")}${arrow}${node("route")}</section>`;
+  const platformDetail = `<section id="platformTraceDetail" class="trace-section"><header><strong>平台内核</strong><span>意图路由 / 领域注册 / 执行计划 / 链路选择</span></header>${node("intent_router")}${arrow}${node("domain_registry")}${arrow}${node("plan")}${arrow}${node("route")}</section>`;
   const pluginDetail = `<section id="pluginTraceDetail" class="trace-section"><header><strong>领域插件</strong><span>当前选择的业务域</span></header>${node("domain_plugin")}<div class="trace-branches three">${domainTraceNodes.map(id => node(id, "compact")).join("")}</div></section>`;
   const capabilityDetail = `<section id="capabilityTraceDetail" class="trace-section"><header><strong>Capability SPI</strong><span>状态 / 检索 / 审核 / 事件</span></header><div class="trace-capabilities">${capabilityTraceNodes.map(id => node(id, "compact")).join("")}</div></section>`;
   $("traceGraph").innerHTML = ["input", "documents", "classification"].map(id => node(id)).join(arrow)
@@ -383,7 +396,8 @@ function resetTrace() {
     + arrow + node("output");
   traceNode("intent_router", "waiting", "等待意图路由");
   traceNode("domain_registry", "waiting", "等待领域校验");
-  traceNode("domain_plugin", "notconnected", "插件封装待接入，当前按链路选择");
+  traceNode("plan", "waiting", "等待生成执行计划");
+  traceNode("domain_plugin", "notconnected", "当前按领域清单分派能力");
   traceNode("investment", "compat", "已接入 · 咨询走对话，交易走确认 + 人工审批");
   investmentTraceNodes.forEach(id => traceNode(id, "skipped", "本轮未进入投资链路"));
   traceNode("capability_state", "skipped", "本轮未触发状态存储");
@@ -442,7 +456,7 @@ function updateTrace(event) {
         setTraceParams("domain_registry", { source: "assistant_agent.classify" }, { route_error: event.route_error });
       } else if (route.domain && event.engine !== "llm-prompt") {
         traceNode("domain_registry", "done", `已校验 ${route.domain} / ${event.intent}`);
-        setTraceParams("domain_registry", { source: "configs/domains.yaml" },
+        setTraceParams("domain_registry", { source: "领域插件 manifest" },
           { domain: route.domain, intent: event.intent, engine: event.engine });
       } else {
         traceNode("domain_registry", "compat", "内置分类模型未走领域注册");
@@ -452,6 +466,16 @@ function updateTrace(event) {
 
   if (["claims", "general", "investment"].includes(event.node) && event.output) {
     setTraceParams("output", event.output, event.status === "done" ? {content: event.output.content, completed: true} : event.output);
+  }
+
+  if (event.node === "plan" && event.output) {
+    const selected = event.output.selected || {};
+    const notes = [];
+    if (event.output.needs_clarification) notes.push("先澄清");
+    if (event.output.needs_confirmation) notes.push("需确认");
+    if (event.output.missing_slots?.length) notes.push(`缺 ${event.output.missing_slots.join("、")}`);
+    traceNode("plan", "done", `${selected.intent || "未识别"} → ${selected.capability || selected.domain || "通用回答"}${notes.length ? ` · ${notes.join(" / ")}` : ""}`);
+    setTraceParams("plan", event.input || {}, event.output);
   }
 
   if (event.node === "route") {

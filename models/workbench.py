@@ -60,7 +60,10 @@ class AssistantRequest(BaseModel):
     claim_id: str | None = Field(default=None, max_length=64)
     documents: list[DocumentAnalysis] = Field(default_factory=list, max_length=6)
     history: list[ChatTurn] = Field(default_factory=list, max_length=12)
+    # 示例理赔工作台的材料补充轮次（旧字段，保留兼容）。
     material_round: int = Field(default=0, ge=0, le=3)
+    # 通用澄清轮次（新字段）；为空时回落到 material_round，旧前端无需改动。
+    round: int | None = Field(default=None, ge=0, le=3)
 
 
 class IntentResult(BaseModel):

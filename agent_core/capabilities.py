@@ -1,9 +1,10 @@
 """对话编排能力注册表：内核按"能力名"分派，领域插件按"能力名"注册实现。
 
-内核认识的能力只有两个内置名字：
+内核认识的能力只有三个内置名字：
 
 - ``answer``：用通用模型直接回答（兜底，任何领域都能回落到它）；
-- ``guard``：高风险 / 案件型意图的拦截确认（不自动执行任何写操作）。
+- ``guard``：高风险 / 案件型意图的拦截确认（不自动执行任何写操作）；
+- ``clarify``：低置信或缺少必填槽位时，用领域清单文案向用户追问（不调模型）。
 
 其余能力名一律由领域清单的 ``IntentSpec.capability`` 声明、由领域插件在
 ``build_services`` 里注册实现。对话图按清单动态选节点，因此新增领域只需
@@ -42,7 +43,8 @@ RedirectHook = Callable[[dict[str, Any]], "Redirect | None"]
 
 ANSWER_CAPABILITY = 'answer'
 GUARD_CAPABILITY = 'guard'
-KERNEL_CAPABILITIES: tuple[str, ...] = (ANSWER_CAPABILITY, GUARD_CAPABILITY)
+CLARIFY_CAPABILITY = 'clarify'
+KERNEL_CAPABILITIES: tuple[str, ...] = (ANSWER_CAPABILITY, GUARD_CAPABILITY, CLARIFY_CAPABILITY)
 
 
 class AssistantCapabilities:
@@ -76,15 +78,19 @@ class AssistantCapabilities:
     def names(self) -> list[str]:
         return list(self._handlers)
 
-    def with_kernel(self, *, answer: AssistantHandler, guard: AssistantHandler) -> "AssistantCapabilities":
+    def with_kernel(self, *, answer: AssistantHandler, guard: AssistantHandler,
+                    clarify: AssistantHandler | None = None) -> "AssistantCapabilities":
         """补齐内核内置能力，返回新实例。
 
         注册表在应用装配期被各插件写入，而内置处理器持有本次请求的模型，
-        因此这里复制而不是就地修改，避免跨请求共享可变状态。
+        因此这里复制而不是就地修改，避免跨请求共享可变状态。``clarify`` 为可选：
+        直接使用该注册表的调用方（如契约测试）可以只补 answer / guard。
         """
         merged = AssistantCapabilities(self._handlers, self._redirects)
         merged._handlers.setdefault(ANSWER_CAPABILITY, answer)
         merged._handlers.setdefault(GUARD_CAPABILITY, guard)
+        if clarify is not None:
+            merged._handlers.setdefault(CLARIFY_CAPABILITY, clarify)
         return merged
 
     def redirect(self, state: dict[str, Any]) -> "Redirect | None":
@@ -174,6 +180,7 @@ def missing_handlers(registry: Any, capabilities: AssistantCapabilities) -> list
 
 __all__ = [
     "ANSWER_CAPABILITY",
+    "CLARIFY_CAPABILITY",
     "GUARD_CAPABILITY",
     "KERNEL_CAPABILITIES",
     "AssistantCapabilities",

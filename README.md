@@ -15,7 +15,7 @@
 
 个人学习资料（`My_Study/`）与培训实现追踪清单已迁至工作区根目录 `../teaching-archive/`，不属于模板运行时；下文个别历史说明中的 `My_Study/Python/` 指该归档目录内的学习环境。
 
-**当前验证基线（2026-11-25 写操作确认闸门后）**：`233 passed, 1 skipped`（领域可插拔 + 意图路由可插拔 + 能力分派 + 写操作确认闸门 + 内核边界门禁契约测试），覆盖率约 83%；跳过项为需要真实 Milvus 的集成测试。`bash scripts/start_mac.sh` 启动后 `/health`、`/ready`、首页与 19 个路由均正常。架构见 [Architecture.md](Architecture.md)，模板化说明见 [TEMPLATE.md](TEMPLATE.md)（培训实现追踪清单已归档至 `../teaching-archive/`），Agent 工作约定见 [AGENTS.md](AGENTS.md)。
+**当前验证基线（2026-11-25 澄清闸门 + plan trace 后）**：`244 passed, 1 skipped`（领域/意图路由可插拔、能力分派、确认闸门、澄清闸门、`/ready` 图校验与内核边界门禁契约测试），覆盖率约 83%；跳过项为需要真实 Milvus 的集成测试。`bash scripts/start_mac.sh` 启动后 `/health`、`/ready`、首页与 19 个路由均正常。架构见 [Architecture.md](Architecture.md)，模板化说明见 [TEMPLATE.md](TEMPLATE.md)（培训实现追踪清单已归档至 `../teaching-archive/`），Agent 工作约定见 [AGENTS.md](AGENTS.md)。
 
 主要链路：
 
@@ -304,7 +304,7 @@ docker compose up -d --build
 
 Apple Silicon 上应用容器为 arm64。若 `--profile infra` 的 Milvus 拉不到 arm64 镜像，可对这些服务单独使用 `--platform linux/amd64`，或只启动 `app` 并指向外部 Milvus。
 
-> 本机验证（macOS 14.8.2 / Apple Silicon / Python 3.15.1）：`pip check` 无冲突，`pytest` 为 **233 passed, 1 skipped**（跳过项需真实 Milvus），`uvicorn app:app` 启动后 `/health`、`health_check.py` 均通过。国内网络安装依赖时请使用上面的清华镜像。
+> 本机验证（macOS 14.8.2 / Apple Silicon / Python 3.15.1）：`pip check` 无冲突，`pytest` 为 **244 passed, 1 skipped**（跳过项需真实 Milvus），`uvicorn app:app` 启动后 `/health`、`health_check.py` 均通过。国内网络安装依赖时请使用上面的清华镜像。
 
 ## 结构与职责
 
@@ -393,13 +393,21 @@ agents/tools/prompts/models/tests及新增Python包均有`__init__.py`。
   `IntentSpec.confirmation`（`api` / `requires_human_review` / `summary`）做确定性裁决，
   声明了契约或 `risk=high` / `mode=case` 的意图一律判"需确认"，绝不落到 `answer`
   （误落时强制改派 `guard`）；目标独立 API、是否需人工审批、裁决来源并入对话图已有的
-  done trace（只加字段、不新增事件，SSE 序列不变）。裁决是纯确定性代码、不调用 LLM，
-  领域 handler 无需感知，新增领域自动生效。装配期自检契约落到自由问答、`api` 指向
-  未注册路由并打 warning（`application.state.confirmation_audit`）。对话链路无状态、
-  无 checkpointer、无 HITL，永不执行写操作；真正执行仍走独立 API 的校验/二次确认/人工审批。
+  done trace（闸门本身不新增事件，plan 为路由层固定 trace）。裁决是纯确定性代码、
+  不调用 LLM，领域 handler 无需感知，新增领域自动生效。装配期自检契约落到自由问答、
+  `api` 指向未注册路由并打 warning（`application.state.confirmation_audit`）。对话链路
+  无状态、无 checkpointer、无 HITL，永不执行写操作；真正执行仍走独立 API 的校验/二次确认/人工审批。
   契约由 `tests/test_confirmation_gate.py` 守护
+- **澄清闸门**：`ClarifyGate`（`agent_core/clarification.py`）按 manifest 的 `required_slots`
+  / `slot_labels` 与路由层 `needs_clarification` 确定性追问，优先级高于确认闸门，
+  文案来自清单、不调用 LLM。缺失槽位时用 `slot_labels` 生成「请补充：…」，低置信时用
+  `description` 生成候选项「你是要…还是要…？」；超过 3 轮停止追问。落点是内核 `clarify`
+  节点，SSE 追加 `clarification_status`（含 `round` / `missing_slots` / `candidates`）。
+  契约由 `tests/test_clarify_gate.py` 守护
+- `classify` 后追加 `plan` trace：输出所选 `domain / intent / capability`、裁决依据、
+  是否需澄清/确认及缺失槽位，工作台「执行计划」节点可展开查看
 - 图负责编排决策，LLM 流式回答由外层执行器（`app.py` 的 `assistant_stream`）负责
-- 无 checkpointer，每次请求新建图，状态仍由前端回传（history / material_round）
+- 无 checkpointer，每次请求新建图，状态仍由前端回传（history / material_round / round）
 - 详细结构见 [Architecture.md](Architecture.md)，意图路由细节见
   [docs/platform-architecture-workflow.md](docs/platform-architecture-workflow.md)
 
@@ -410,10 +418,10 @@ agents/tools/prompts/models/tests及新增Python包均有`__init__.py`。
 改造点：
 
 1. **引入 checkpointer**：给 `build_assistant_graph` 接 `AsyncSqliteSaver`（复用 `.data/checkpoints.sqlite` 或独立库），对话状态、材料轮次存后端。
-2. **材料回流改 interrupt**：当前 `material_round` 由前端回传；改为 `interrupt()` 挂起，前端从「传历史」变成 `Command(resume=...)` 恢复。
+2. **回流改 interrupt**：当前 `material_round` / `round` 由前端回传；改为 `interrupt()` 挂起，前端从「传历史」变成 `Command(resume=...)` 恢复。
 3. **保单查询反问改 interrupt**：缺保单号时 `interrupt` 挂起等用户补保单号，而不是一次性反问结束。
 4. **恢复 token 级流式**：图内 LLM 节点改用 `graph.astream_events()`（`on_chat_model_stream`）捕获 token，替代当前「图外流式回答」，使回答也成为图节点。
-5. **前端 state 管理**：从「前端保存 history/material_round」改为「后端 checkpointer 保存，前端只传 thread_id + resume」。
+5. **前端 state 管理**：从「前端保存 history/material_round/round」改为「后端 checkpointer 保存，前端只传 thread_id + resume」。
 6. **测试迁移**：`FakeWorkbenchModel` 适配图流式回调，补充断点续跑用例。
 
 完成后两条链路（对话助手、理赔状态机）共用同一套 LangGraph + checkpointer + interrupt 模式。
@@ -433,7 +441,7 @@ agents/tools/prompts/models/tests及新增Python包均有`__init__.py`。
 | PyYAML | 6.0.3 | 6.0.3（纯 Python wheel） | 官方无 cp315 wheel，见 `vendor/` |
 | ruff | 0.9.10 | 不变 | 自带 `py3-none-win_amd64` wheel |
 
-> 验证结果：`pip check` 无依赖冲突；本轮测试集在 macOS 上为 **233 passed, 1 skipped**（跳过的是需要真实 Milvus 服务的集成用例），Windows 未在本轮复测。
+> 验证结果：`pip check` 无依赖冲突；本轮测试集在 macOS 上为 **244 passed, 1 skipped**（跳过的是需要真实 Milvus 服务的集成用例），Windows 未在本轮复测。
 
 Windows（PowerShell）：
 
@@ -536,7 +544,7 @@ bash scripts/start_mac.sh --no-reload  # 关闭热重载
 | 路由 | 行为 |
 | --- | --- |
 | GET /health | 仅进程存活，不代表模型、embedding 或 reranker 可用 |
-| GET /ready | 就绪探针：检查理赔图与审计库，未就绪返回 503；当前不检查 embedding/reranker |
+| GET /ready | 就绪探针：检查插件 `graph_keys` 声明的图（默认 `claims` / `investment`）与审计库，未就绪返回 503；当前不检查 embedding/reranker |
 | POST /api/claims/process | 创建审核工作流；缺保单号进入补材料中断 |
 | POST /api/demo/claims/process | 用固定合成案件运行完整理赔状态机；仅非生产环境 |
 | POST /api/demo/claims/process-live | 用真实模型 + 内存条款跑完整判责演示；仅非生产环境 |
@@ -582,7 +590,7 @@ CORS → RequestID → 认证 → 请求体上限 → 限流 → 审计 → 业�
 python -m scripts.audit_verify --limit 10   # 校验哈希链，退出码 0 = 完整
 ```
 
-`/health` 只表示进程存活；`/ready` 额外检查理赔图与审计库可用，未就绪返回 503，适合作为 K8s readiness 或负载均衡摘流依据。
+`/health` 只表示进程存活；`/ready` 额外检查插件 `graph_keys` 声明的图（默认 `claims` / `investment`）与审计库可用，未就绪返回 503，适合作为 K8s readiness 或负载均衡摘流依据。
 
 > 本中间件是**接入层**；三专家模型调用仍有独立的 `MiddlewareChain`（脱敏、按案限流、缓存、熔断重试、HITL 标记），两层分工见 [docs/platform-architecture-workflow.md](docs/platform-architecture-workflow.md) §2.3。
 >
@@ -742,7 +750,7 @@ curl -s http://127.0.0.1:8001/api/rag/answer \
 - 意图路由已接入 `/api/assistant/stream`：JEV / LLM / Hybrid / Shadow 可切换，代码默认 shadow，当前 `.env` 为 hybrid；
 - BGE-M3 + BGE-Reranker 已启用，正常检索返回 `rerank_fallback=false`；
 - 索引已建成：`investment_wiki` 约 55 个 chunk，`knowledge_general` 约 3 个 chunk；
-- `233 passed, 1 skipped`，覆盖率约 83%；审计哈希链、请求 ID、PII 脱敏和 RAG 诊断字段可用；
+- `244 passed, 1 skipped`，覆盖率约 83%；审计哈希链、请求 ID、PII 脱敏和 RAG 诊断字段可用；
 - 线上 `/ai/` 已通过 nginx Basic Auth 部署，`app` 容器只监听 `127.0.0.1:8001`。
 
 **仍需完善**

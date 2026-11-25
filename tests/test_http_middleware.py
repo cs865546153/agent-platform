@@ -148,3 +148,25 @@ def test_ready_probe(make_client) -> None:
     response = client.get('/ready')
     assert response.status_code == 200
     assert response.json() == {'status': 'ready', 'checks': {'graph': True, 'audit': True}}
+
+
+def test_ready_probe_rejects_declared_but_missing_graph(make_client) -> None:
+    """插件声明了 graph_keys 却没有装配对应图时，/ready 必须报未就绪。"""
+    from agent_core.plugins import PluginRegistry
+    from domains.base import DomainPluginBase
+
+    class GhostPlugin(DomainPluginBase):
+        name = 'ghost'
+        graph_keys = ('ghost_graph',)
+
+    client = make_client(registry=PluginRegistry([GhostPlugin()]))
+    response = client.get('/ready')
+    assert response.status_code == 503
+    assert response.json() == {'status': 'not_ready', 'checks': {'graph': False, 'audit': True}}
+
+
+def test_default_registry_declares_expected_graphs() -> None:
+    from domains.registry import default_registry
+
+    declared = {key for plugin in default_registry().all() for key in plugin.graph_keys}
+    assert declared == {'claims', 'investment'}

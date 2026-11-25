@@ -13,6 +13,7 @@ LOGGER = logging.getLogger(__name__)
 class InvestmentPlugin(DomainPluginBase):
     name = "investment"
     tags = ["投资域"]
+    graph_keys = ("investment",)
 
     def build_services(self, ctx: AppContext, overrides: dict[str, Any]) -> None:
         from adapters.investment import DemoInvestmentBackend, InvestmentBackend

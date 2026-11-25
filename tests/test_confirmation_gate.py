@@ -248,13 +248,13 @@ def test_domain_handler_trace_carries_confirmation_without_new_events() -> None:
 
     assert state['capability'] == 'trade_gate'  # 落点未被改派
     traces = [e['trace'] for e in state['events'] if 'trace' in e]
-    # SSE 事件序列与未启用闸门时完全一致：闸门只加字段，不新增节点。
+    # 闸门不额外新增事件；plan 是路由层固定 trace，序列对确认闸门保持稳定。
     assert [(t['node'], t['status']) for t in traces] == [
         ('classification', 'running'), ('classification', 'done'),
-        ('route', 'done'),
+        ('plan', 'done'), ('route', 'done'),
         ('investment', 'running'), ('investment', 'done'),
     ]
-    assert len(state['events']) == 7  # 5 个 trace + 1 个 intent + 1 个 content
+    assert len(state['events']) == 8  # 6 个 trace + 1 个 intent + 1 个 content
     investment_done = next(t for t in traces if t['node'] == 'investment' and t['status'] == 'done')
     # 原有字段保持，额外并入裁决（结构化、可审计）。
     assert investment_done['output']['executed'] is False

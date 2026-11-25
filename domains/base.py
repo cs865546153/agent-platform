@@ -91,6 +91,9 @@ class DomainPluginBase:
 
     name: str = "unnamed"
     tags: list[str] = []
+    # 本插件在 build_graphs 中会写入 ctx.graphs 的 key。就绪探针据此核对
+    # "声明的图都装配成功"，而不是只看"至少有一个图"。无图领域保持为空。
+    graph_keys: tuple[str, ...] = ()
     _manifest_cache: Any = None
 
     @classmethod

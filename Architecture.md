@@ -40,14 +40,15 @@
        v
 【内核能力层】 agent_core/ —— 领域无关
   plugins.py  : DomainPlugin 协议、AppContext、PluginRegistry
-  capabilities.py : 对话编排能力表（内核只内置 answer / guard，其余由领域注册）
+  capabilities.py : 对话编排能力表（内核只内置 answer / guard / clarify，其余由领域注册）
   confirmation.py : 写操作确认闸门（按清单确定性裁决，写操作绝不落自由问答）
+  clarification.py : 澄清闸门（required_slots / 低置信候选，确定性追问，不调用模型）
   security.py : 统一认证与生产密钥校验；sse.py : SSE 帧编码（app.py 已接入）
   intent/     : JEV / LLM / Hybrid / Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
        |
        v
 【编排层】（领域图由各插件构建，checkpointer 由内核在 lifespan 注入）
-  链路① 对话助手(LangGraph)  : classify(IntentRouter) -> 按意图清单派落点能力（answer / guard / 领域能力）（回答外层流式）
+  链路① 对话助手(LangGraph)  : classify(IntentRouter) -> plan trace -> 按能力名分派（answer / guard / clarify / 领域能力）
   链路② 理赔状态机(LangGraph) : intake -> policy -> experts(子图) -> auto/review/investigate
        └ experts 子图          : expert(Send 扇出三专家) -> aggregate
   链路③ 工具/规划(未接主app)  : AgentExecutor、Plan-and-Execute、RunnableWithMessageHistory
@@ -136,13 +137,16 @@ create_app(registry)
   -> build_assistant_intent_router(cfg, intent_model, domain_registry, slot_extractor)
        显式 intent_router 注入时跳过构建，内核不接管其生命周期
        slot_extractor 来自 AppContext.slot_extractors（领域插件注册的业务槽位规则）
-  -> IntentRoutingPolicy.from_registry(intent_domain_registry, ctx.capabilities, confirm_gate)
-       意图 -> IntentSpec.capability（能力名）+ 领域处理器；内核只内置 answer / guard
-  -> ConfirmGate.from_registry(...)（确定性裁决，不调用 LLM）
-       声明 confirmation / risk=high / mode=case 一律判"需确认"；
-       误落 answer 时强制改派 guard，其余领域能力原样保留
-  -> assistant 图按能力名动态建节点（节点集合 = 已注册能力名 + 两个内置落点）
-       裁决并入已有 done trace（只加字段、不新增事件），SSE 序列不变
+   -> IntentRoutingPolicy.from_registry(intent_domain_registry, ctx.capabilities,
+        confirm_gate, clarify_gate)
+        意图 -> IntentSpec.capability（能力名）+ 领域处理器；内核只内置 answer / guard / clarify
+   -> ConfirmGate.from_registry(...)（确定性裁决，不调用 LLM）
+        声明 confirmation / risk=high / mode=case 一律判"需确认"；
+        误落 answer 时强制改派 guard，其余领域能力原样保留
+   -> ClarifyGate.from_registry(...)（确定性追问，优先级高于确认，不调用 LLM）
+        required_slots 缺槽位 / needs_clarification 低置信 -> 内核 clarify 节点
+   -> assistant 图按能力名动态建节点（节点集合 = 已注册能力名 + 三个内置落点）
+        classify 追加 plan trace（所选能力 / 依据 / 澄清 / 确认），裁决并入已有 done trace
 ```
 
 `configs/domains.yaml` 已瘦身为只含 general 的回退清单；完整三域清单由
@@ -222,15 +226,17 @@ intent = IntentResult(intent=route.intent, confidence=route.confidence, slots=ro
 
 内核不认识任何领域，也不做意图字符串比较：`classify` 把 `(领域, 意图)` 解析成
 **能力名**（领域清单 `IntentSpec.capability`），对话图的节点集合 = 已注册能力名
-（`ctx.capabilities`）+ 内核内置 `answer` / `guard`。因此新增领域的对话分支只要
+（`ctx.capabilities`）+ 内核内置 `answer` / `guard` / `clarify`。因此新增领域的对话分支只要
 注册能力就能被路由到。
 
 ```
 START
   -> classify（IntentRouter：JEV/LLM/Hybrid，默认 shadow；解析出 capability + domain + slots）
+  -> plan（SSE trace：所选能力 / 依据 / 澄清 / 确认裁决，非图节点）
   -> 条件路由 route_after_classify（按能力名选节点，落点未实现时回内置 answer）
        |-- answer（内核）              -> END（general 模型流式回答）
        |-- guard（内核）               -> END（案件型/高风险未实现时拦截，不执行）
+       |-- clarify（内核）             -> END（缺必填槽位或低置信时确定性追问，不走 LLM）
        |-- policy_query（理赔插件）     -> END（反问保单号 / 输出保单摘要）
        |-- claim_workflow（理赔插件）   -> END（缺材料回流追问 ≤3 轮；材料齐三专家 + RAG 判责）
        |-- claims_answer（理赔插件）    -> END（理赔通用问答）
@@ -244,6 +250,7 @@ START
 |---|---|---|
 | answer | 内核 | 通用模型直接回答；清单外意图、无处理器的对话都落到这里 |
 | guard | 内核 | 案件型 / 高风险意图没有领域处理器时拦截，提示走业务接口确认 |
+| clarify | 内核 | 缺 `required_slots` 或 `needs_clarification` 时确定性追问；文案来自 manifest，不调用模型 |
 
 **领域注册的落点（示例）**
 
@@ -269,8 +276,12 @@ START
 - `route_error`：路由异常摘要，出现时表示本轮已回落到内置分类；兜底分类自身
   不符合契约时追加 `classify:<异常名>`（不带模型回显），意图按 `未识别` 处理。
 
-`route` 节点输出落点与依据：`selected`（领域）、`capability`（对话图节点名）、
-`handler`（该能力是否有领域实现）、`declared`（意图是否在领域清单里）。
+`plan` trace 输出执行计划：`selected`（`domain` / `intent` / `capability`）、`basis`
+（`declared` / `fallback` / `redirect`）、`missing_slots`、`needs_clarification`、
+`needs_confirmation`；`route` 节点输出落点与依据：`selected`（领域）、`capability`
+（对话图节点名）、`handler`（该能力是否有领域实现）、`declared`（意图是否在领域清单里）。
+进入 `clarify` 节点时另发 `clarification_status`：`status=asking`、`round`、`max_rounds`、
+`missing_slots`、`candidates`。
 
 工作台展示位置：「调用链路 → 平台内核」下
 
@@ -278,17 +289,18 @@ START
   影子一致性，展开「输入 / 输出参数」可见 `engine`、`domain`、`intent`、`confidence`、
   `fallback_reason`、`warnings`、`shadow`；
 - **领域注册校验**：显示 `已校验 <domain> / <intent>`；
+- **执行计划**：显示 `<intent> → <capability>`，并标注「先澄清 / 需确认 / 缺 <槽位>」；
 - 聊天消息上的意图徽章同时显示引擎，例如 `交易指令 · 100% · JEV`。
 
 **外层执行器**（`app.py` 的 `assistant_stream`）
 
 ```
-ainvoke 图 -> 重放 events（trace + intent + material_status + content）-> 流式 LLM 回答 -> done
+ainvoke 图 -> 重放 events（trace + intent + clarification_status + material_status + content）-> 流式 LLM 回答 -> done
 ```
 
 > 链路① 的对话预审与正式核赔已分开：材料齐全才由理赔域的 `claim_workflow` 能力进入核赔
 > （三专家 + RAG 判责），缺材料只回流追问；投资域的交易指令由 `trade_gate` 能力只拦截不下单。
-> 这些落点都写在领域 manifest 的 `capability:` 里，内核只认 `answer` / `guard` 两个内置落点。
+> 这些落点都写在领域 manifest 的 `capability:` 里，内核只认 `answer` / `guard` / `clarify` 三个内置落点。
 > 当前为方案 A（无状态，每次请求新建图）；方案 B（checkpointer + interrupt 断点续跑）见 README。
 
 ## 四、链路② 理赔状态机（LangGraph，/api/claims/*）
@@ -384,7 +396,8 @@ INTENT_ROUTER_ENABLED=true
 约定：
 
 - 阈值：`confidence >= INTENT_CONFIDENCE_THRESHOLD(0.8)`、
-  `margin >= INTENT_MARGIN_THRESHOLD(0.2)`；低于阈值触发兜底或标记 `needs_clarification`。
+  `margin >= INTENT_MARGIN_THRESHOLD(0.2)`；低于阈值触发兜底或标记 `needs_clarification`，
+  后者由 `ClarifyGate` 结合清单 `description` 生成候选项并进入内核 `clarify` 节点。
 - JEV 是英文优先模型；中文输入可开 `INTENT_TRANSLATE_TO_ENGLISH=true`，
   未开翻译会记录 `cjk_without_translation` 警告。
 - 发送前先 `mask_pii`，JEV 只收到脱敏文本；`JEV_API_KEY` 不写入日志、报告和镜像。
@@ -393,7 +406,8 @@ INTENT_ROUTER_ENABLED=true
 - 保单号：JEV 不返回槽位，`AssistantIntentRouter` 对「保单查询」意图用本地正则从
   当前问题与用户历史中补齐；识别不到仍按原逻辑反问保单号。
 - 关闭开关：`INTENT_ROUTER_ENABLED=false`。
-- 观测：`intent.route` 日志（不含用户原文）+ SSE trace 的 `engine` / `route` / `route_error`。
+- 观测：`intent.route` 日志（不含用户原文）+ SSE trace 的 `engine` / `plan` / `route` /
+  `route_error` / `clarification_status`。
 - 评测：`scripts/eval_intent.py` + `data/intent_golden.jsonl`。
 - 2026-10-27 实测（JEV 单引擎，39 条）：联合准确率 `0.897`、领域 `1.000`、意图 `0.897`、
   P50/P95 `571/628ms`；主要错误为「组合诊断 ↔ 投资咨询」。

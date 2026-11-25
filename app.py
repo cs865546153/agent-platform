@@ -196,6 +196,7 @@ def create_app(
     # 对话图的分支策略 = 领域清单 + 能力注册表。两者都在 build_services 之后就位，
     # 因此新增领域只要声明意图并注册能力即可被路由，不必改内核。
     from agent_core.capabilities import missing_handlers
+    from agent_core.clarification import ClarifyGate
     from agent_core.confirmation import ConfirmGate
     from agents.assistant_agent import IntentRoutingPolicy
 
@@ -207,8 +208,11 @@ def create_app(
     ctx.confirm_gate = effective_confirm_gate
     for issue in effective_confirm_gate.audit_capabilities():
         logger.warning('确认闸门装配检查：%s', issue)
+    # 澄清闸门：低置信 / 缺必填槽位时先用清单文案追问，不调用模型。
+    effective_clarify_gate = ClarifyGate.from_registry(intent_domain_registry)
     routing_policy = IntentRoutingPolicy.from_registry(
-        intent_domain_registry, ctx.capabilities, confirm_gate=effective_confirm_gate,
+        intent_domain_registry, ctx.capabilities,
+        confirm_gate=effective_confirm_gate, clarify_gate=effective_clarify_gate,
     )
     if intent_router is None:
         # 领域插件在 build_services 注册的槽位抽取器交给适配层；内核不认识具体槽位名。
@@ -245,6 +249,7 @@ def create_app(
         application.state.intent_registry = intent_domain_registry
         application.state.capabilities = ctx.capabilities
         application.state.confirm_gate = effective_confirm_gate
+        application.state.clarify_gate = effective_clarify_gate
         # 图内分支策略从领域清单与能力注册表派生；未声明领域时只剩内核内置能力。
         application.state.intent_routing_policy = routing_policy
         try:
@@ -286,10 +291,20 @@ def create_app(
 
     @application.get('/ready', tags=['健康检查'])
     async def ready(response: Response) -> dict[str, Any]:
-        """就绪探针：依赖（图与审计库）未就绪时返回 503，与存活探针区分。"""
+        """就绪探针：依赖（图与审计库）未就绪时返回 503，与存活探针区分。
+
+        图的就绪不看"有没有装进任何一个图"，而是核对领域插件声明的 ``graph_keys``
+        是否都已写入 ``ctx.graphs``；缺图时明确报未就绪，避免半装配仍对外服务。
+        """
         audit = getattr(application.state, 'audit', None)
+        expected_graphs = {
+            key for plugin in registry.all() for key in getattr(plugin, 'graph_keys', ())
+        }
+        missing_graphs = sorted(expected_graphs.difference(ctx.graphs))
+        if missing_graphs:
+            logger.warning('就绪检查：领域声明了未装配的图 %s', missing_graphs)
         checks = {
-            'graph': bool(ctx.graphs),
+            'graph': bool(ctx.graphs) and not missing_graphs,
             'audit': bool(audit is not None and await asyncio.to_thread(audit.ping)),
         }
         ok = all(checks.values())
@@ -431,6 +446,7 @@ def create_app(
                     'documents': body.documents,
                     'history': body.history,
                     'material_round': body.material_round,
+                    'round': (body.round if body.round is not None else body.material_round),
                     'context': context,
                     'started': started,
                     'events': [],

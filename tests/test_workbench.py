@@ -109,7 +109,7 @@ def test_text_document_analysis_and_streaming_question() -> None:
         traces = [event['trace'] for event in events if 'trace' in event]
         assert [(event['node'], event['status']) for event in traces] == [
             ('classification', 'running'), ('classification', 'done'),
-            ('route', 'done'),
+            ('plan', 'done'), ('route', 'done'),
             ('claim_intake', 'done'), ('claim_documents', 'done'),
             ('claims', 'running'), ('claim_followup', 'done'),
             ('claim_policy', 'skipped'), ('claim_damage', 'skipped'),
@@ -117,14 +117,16 @@ def test_text_document_analysis_and_streaming_question() -> None:
             ('claim_confidence', 'skipped'), ('claim_decision', 'skipped'),
             ('claims', 'done'),
         ]
-        assert traces[2]['selected'] == 'claims'
+        assert traces[2]['output']['selected']['domain'] == 'claims'
+        assert traces[2]['output']['basis'] in {'declared', 'fallback', 'redirect'}
+        assert traces[3]['selected'] == 'claims'
         assert traces[0]['input']['messages'][-1]['role'] == 'human'
         assert traces[1]['output']['intent'] == '材料审核'
-        assert traces[2]['output']['selected'] == 'claims'
-        assert traces[3]['output']['check_type'] == '对话预审'
-        assert traces[4]['output']['average_extraction_confidence'] == 0.96
-        assert traces[6]['input']['round'] == 1
-        assert traces[6]['output']['action'] == 'request_more_documents'
+        assert traces[3]['output']['selected'] == 'claims'
+        assert traces[4]['output']['check_type'] == '对话预审'
+        assert traces[5]['output']['average_extraction_confidence'] == 0.96
+        assert traces[7]['input']['round'] == 1
+        assert traces[7]['output']['action'] == 'request_more_documents'
         material_event = next(event for event in events if 'material_status' in event)
         assert material_event['material_status'] == 'incomplete'
         assert material_event['material_round'] == 1

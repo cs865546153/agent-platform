@@ -16,8 +16,9 @@ app.py                     内核：FastAPI 装配 + 通用路由（health/ready
      └─ overrides / models  领域依赖注入点，键名由插件解释（内核签名无领域名）
 agent_core/                领域无关内核
   ├─ plugins.py            DomainPlugin 协议（intent_manifest）、AppContext（slot_extractors/capabilities）、PluginRegistry
-  ├─ capabilities.py       对话编排能力注册表：内核按"能力名"分派，只内置 answer / guard
+  ├─ capabilities.py       对话编排能力注册表：内核按"能力名"分派，只内置 answer / guard / clarify
   ├─ confirmation.py       写操作确认闸门：按清单确定性裁决，写操作绝不落到自由问答
+  ├─ clarification.py      澄清闸门：required_slots / 低置信候选，确定性追问且不调用模型
   ├─ security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容旧部署）
   ├─ sse.py                SSE 帧编码（已接入 app.py，无内联副本）
   └─ intent/               JEV/LLM/Hybrid/Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
@@ -47,6 +48,7 @@ configs/domains.yaml       运行时回退清单：只保留无插件领域（ge
 | 领域槽位兜底抽取 | `AppContext.slot_extractors`，由插件在 `build_services` 注册 | 内核不内置业务字段形态 |
 | 对话编排能力分派 | `agent_core/capabilities.py` + `agents/assistant_agent.py` 动态建图 | 在 `build_services` 里 `ctx.capabilities.register(名字, handler)` |
 | 写操作确认闸门 | `agent_core/confirmation.py`（`ConfirmGate` 确定性裁决） | 写操作意图在 manifest 声明 `confirmation`（指向独立 API）；内核自动拦截并引导，不执行动作 |
+| 澄清闸门 | `agent_core/clarification.py`（`ClarifyGate` 确定性裁决） | 需要要素的意图在 manifest 声明 `required_slots` / `slot_labels`；缺槽位或低置信由内核 `clarify` 追问 |
 | 多路召回 + RRF + BGE-Rerank + 引用校验 | `tools/knowledge_rag.py`、`tools/rerank.py` | 可选复用 |
 | HITL（中断 + 恢复 + 人工审批） | LangGraph `interrupt` + `domains/base.py:gate_resume/resume_gate` | 图内声明中断，恢复门控用基类 |
 | SSE 流式回答 | `app.py` assistant 路由 + `agent_core/sse.py` | 否 |
@@ -176,6 +178,10 @@ def register_my_capabilities(ctx, *, model) -> None:
 - 声明了能力但没注册实现不会报错，只会在装配时打 warning，
   可用 `agent_core.capabilities.missing_handlers()` 自检（`tests/test_template_boundary.py` 已钉住）；
 - 处理器抛异常时内核显式降级为"转人工"，SSE 不中断。
+- 需要追问要素时，在 manifest 的 `IntentSpec` 声明 `required_slots`（snake_case 字段名）
+  与 `slot_labels`；缺失时内核先走 `clarify`，澄清优先级高于 `ConfirmGate`。
+- 有业务图的插件在 `DomainPluginBase` 声明 `graph_keys`（如 `("claims",)`），
+  `/ready` 会据此检查装配是否完整；跳过该字段的纯能力插件不受影响。
 
 ### 步骤 4：登记领域
 
@@ -217,7 +223,8 @@ pytest -q                                        # 全量
   不出现意图字符串、不残留旧分支词汇）。
 - **工作台请求模型仍带示例形态**：`AssistantRequest.claim_id` / `material_round` 与
   `models/workbench.py` 的理赔演示响应属于示例前端契约，内核只透传不解释；
-  原创业务可替换为自己的案件主键，或改用 `slots` 承载。
+  通用澄清轮次走新增的 `round`（与 `material_round` 兼容，上限 3），原创业务可替换为
+  自己的案件主键，或改用 `slots` 承载。
 - **HITL 恢复跨进程可用**：LangGraph 重启后不再重建中断载荷，快照只剩待执行节点，
   因此恢复门控与响应阶段都用 `domains/base.py` 的 `gate_resume` / `resume_gate`
   按 `(状态, 待执行节点)` 重建；领域新增中断点时要一并给出 `node` 判据。
@@ -236,17 +243,16 @@ pytest -q                                        # 全量
 
 ## 5. 验证基线（2026-11-25）
 
-- `233 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；新增写操作确认闸门
-  11 条契约测试（契约形状、确定性裁决、强制不落自由问答、结构化引导、装配自检、
-  注入不丢失、SSE 事件序列不变）
-- Ruff 全项目通过；本次改动涉及的文件 Mypy 零错误（剩余告警均在未改动的既有模块）
+- `244 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；写操作确认闸门 11 条
+  契约 + 澄清闸门 9 条契约（槽位 / 意图候选 / 轮次上限 / 优先级 / 图内追问 / 清单声明）
+- Ruff 本次改动文件全部通过
 - 可插拔契约由 `tests/test_domain_plugin_template.py`、`tests/test_intent_plugin_template.py`、
-  `tests/test_capabilities.py`、`tests/test_confirmation_gate.py`、
+  `tests/test_capabilities.py`、`tests/test_confirmation_gate.py`、`tests/test_clarify_gate.py`、
   `tests/test_template_boundary.py` 守护
-- 真实装配冒烟：`/health`、`/ready`、`/openapi.json` 均 200，19 条路由全部注册
-  （含迁移后的 `/api/demo/claims/*`）；`POST /api/demo/claims/process` 走完整状态机；
+- 真实装配冒烟：`/health`、`/ready`、`/openapi.json` 均 200，19 条路由全部注册；
+  `/ready` 额外校验插件 `graph_keys` 声明的 `claims` / `investment` 两张图；
   默认插件集注册 `claim_workflow / claims_answer / investment_answer / policy_query / trade_gate`
-  五个对话能力，`missing_handlers()` 为空
+  五个领域对话能力，`clarify` 为内核内置能力，`missing_handlers()` 为空
 
 > 启动脚本注意：`start_mac.sh` 开了 `set -u`，在 echo 中文提示里 `$var` 后紧跟全角括号时
 > Bash 会把 UTF-8 首字节并进变量名（如 `$app_log（` 误判为 `app_log\xef`），导致启动即报

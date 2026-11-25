@@ -3,7 +3,7 @@
 本文件是项目级的 Agent 工作说明。根目录使用 `AGENTS.md`（复数、全大写）是通用约定；
 个人学习笔记已归档至工作区根目录 `../teaching-archive/`，不作为执行规范。
 
-最后全量扫描：2026-10-26。
+最后全量扫描：2026-11-25（本轮复跑全量测试与关键路径核对；上次全量 2026-10-26）。
 
 ## 项目定位
 
@@ -58,18 +58,29 @@ agents/                 接入层、理赔/投资/对话编排、审计、可观
   audit_store.py        append-only + 哈希链审计
   middleware_audit.py   PII 脱敏、模型层限流/缓存/重试/审计
   memory.py             会话窗口、摘要、实体冲突、Redis（可选）
+  confidence.py         置信度评估与阈值规则
+  risk_agent.py         理赔风险识别专家
+  observability.py      LangFuse / 链路观测出口（可选）
 tools/                  业务工具、RAG、Milvus、rerank、文档解析
   knowledge_rag.py      通用知识库多路召回 + RRF + rerank + 引用
   investment_rag.py     投资 Wiki RAG
   rag_retrieval.py      理赔条款检索与引用校验
   rerank.py             BGE-Reranker HTTP 客户端与词项降级
   vector_store.py       Milvus 集合与可达性检查
+  milvus_conn.py        Milvus 连接参数与 keepalive（统一入口）
   document_analysis.py  附件校验、文本抽取、多模态单证识别
+  claim_tool.py         理赔工具集（查询 / 核验 / 回写）
+  claim_write_producer.py outbox 回写队列（幂等键、租约、去重）
+  policy_store.py       本地模拟保单（demo，`.data/policies.sqlite`）
+  material_check.py     材料齐套校验
+  demo_clauses.py       合成理赔条款（演示用）
 adapters/               真实业务适配器（HTTP + 熔断 + 降级）与 demo 后端
+  legacy_adapter.py     旧接口兼容适配器
 agent_core/             领域无关内核
   plugins.py            DomainPlugin 协议、AppContext、PluginRegistry（模板扩展点）
-  capabilities.py       对话编排能力注册表：按能力名分派，内置 answer / guard
+  capabilities.py       对话编排能力注册表：按能力名分派，内置 answer / guard / clarify
   confirmation.py       写操作确认闸门：按清单确定性裁决，写操作绝不落到自由问答
+  clarification.py      澄清闸门：按 required_slots / 低置信候选确定性追问，不调用 LLM
   security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容）、生产密钥校验
   sse.py                SSE 帧编码（app.py 已接入）
   intent/               意图路由公共层：JEV / LLM / Hybrid / Registry / adapter
@@ -81,6 +92,7 @@ domains/                领域插件（可增删，新增领域不改内核）
   example/              最小示例：演示新领域如何接入
 TEMPLATE.md             模板定位、内核/领域边界、新增领域五步指南
 configs/domains.yaml    领域/意图回退清单（含 description_en）；主事实源已随插件 manifest.yaml
+models/                 领域无关模型（Pydantic / 工作台）+ 本地 BGE 权重目录（权重 gitignore）
 data/investment_wiki/   投资 Wiki 源文件（约 55 chunks）
 data/knowledge_base/    通用知识库源文件（当前约 3 chunks）
 data/intent_golden.jsonl 意图评测集（39 条合成样本）
@@ -92,6 +104,9 @@ isolated_deep/          官方 Deep Agents 独立依赖与运行时（不在主�
 static/                 工作台前端
 tests/                  pytest 测试
 vendor/                 Python 3.15 下使用的纯 Python PyYAML wheel
+.opencode/skills/       本机 Agent 技能（vps-trojan-proxy 等），与业务运行时代码无关
+invest.md               投资域链路草稿；claims-ai-agent-architecture.html 为架构可视化
+.workbuddy/             个人工作记忆（非规范，不作为实现依据）
 .data/                  运行期数据，已 gitignore
 ```
 
@@ -161,7 +176,7 @@ lsof -nP -iTCP:8001 -sTCP:LISTEN
 | 方法 | 路径 | 认证 | 说明 |
 | --- | --- | --- | --- |
 | GET | `/health` | 无 | 存活探针 |
-| GET | `/ready` | 无 | 就绪探针（图 + 审计库），未就绪返回 503 |
+| GET | `/ready` | 无 | 就绪探针（插件 `graph_keys` 声明的图 + 审计库），未就绪返回 503 |
 | GET | `/metrics` | `X-API-Key` | Prometheus 指标 |
 | GET | `/` | 无 | 工作台页面 |
 | POST | `/api/assistant/stream` | `X-API-Key` | 对话助手，SSE 流式 |
@@ -198,9 +213,11 @@ lsof -nP -iTCP:8001 -sTCP:LISTEN
 ```text
 START
   → classify（意图路由 → 领域清单解析出「能力名」）
-  → 条件路由（节点集合 = 已注册能力名 + 内核内置 answer / guard）
+  → plan（SSE trace：所选能力 / 依据 / 澄清 / 确认，非图节点）
+  → 条件路由（节点集合 = 已注册能力名 + 内核内置 answer / guard / clarify）
       ├─ answer（内核）        → END（general 模型流式回答）
       ├─ guard（内核）         → END（案件型 / 高风险意图未实现时拦截，不自动执行）
+      ├─ clarify（内核）       → END（缺必填槽位或低置信候选时确定性追问，不走 LLM）
       ├─ claims_answer / policy_query / claim_workflow（理赔插件注册）
       │     └─ claim_workflow：缺材料 → follow_up（最多 3 轮，超限转人工）
       │                          材料齐 → 三专家 + RAG 判责
@@ -218,7 +235,10 @@ START
 - 意图分类：优先走 `IntentRouter`（`application.state.intent_router`），默认 `shadow`
   （LLM 主路由 + JEV 影子）；路由异常回落 `get_model('classification')` 内置提示分类，
   两者最终都收敛为 `IntentResult`。
-- 历史、`material_round` 由前端回传；该图没有 checkpointer。
+- 历史、`material_round` 与通用澄清轮次 `round` 由前端回传；该图没有 checkpointer。
+- `needs_clarification` 不再只是 trace 标记：`ClarifyGate` 优先级高于 `ConfirmGate`，
+  缺 `required_slots` 或低置信候选时落 `clarify`，追问文案来自 manifest 的
+  `slot_labels` / `description`，超过 3 轮停止追问；澄清阶段不调用模型、不执行写操作。
 - 通用问答和理赔问答当前**不走知识库 RAG**；只有投资意图会调用 `investment_rag`。
 - 交易指令在对话链路只做拦截和提示，不会下单；正式流程走 `/api/investment/*` 的
   二次确认 + 人工审批。
@@ -279,7 +299,7 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
   **能力名**（`IntentSpec.capability`，未声明时按 `mode`/`risk` 回落），
   新增领域不要改图代码里的意图字符串。JEV 使用 `description_en`，新增意图务必补英文描述。
 - `agent_core/capabilities.py`：`AssistantCapabilities` 注册表（能力名全局唯一，
-  即对话图节点名）、`Redirect` 意图改写钩子、`with_kernel()` 补内置 `answer`/`guard`、
+  即对话图节点名）、`Redirect` 意图改写钩子、`with_kernel()` 补内置 `answer`/`guard`/`clarify`、
   `missing_handlers()` 供装配期自检（`app.py` 会打 warning）。
 - `agent_core/confirmation.py`：`ConfirmGate` 写操作确认闸门。从聚合清单读取
   `IntentSpec.confirmation`，对声明契约或 `risk=high`/`mode=case` 的意图确定性裁决
@@ -287,6 +307,11 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
   `audit_routes()` 供装配自检（落点错误 / `api` 死链）。裁决并入对话图已有 done trace，
   只加字段不新增事件。**新增写操作意图必须在插件 manifest 声明 `confirmation`**，
   内核不写死业务路径。契约由 `tests/test_confirmation_gate.py` 守护。
+- `agent_core/clarification.py`：`ClarifyGate` 澄清闸门。从 `IntentSpec.required_slots` /
+  `slot_labels` 与路由层 `needs_clarification` / `intent_probabilities` 确定性裁决；
+  槽位级优先（缺什么问什么）、意图级其次（清单 `description` 生成候选项），
+  优先级高于确认闸门，文案不写死在内核。**新增需追问要素的意图必须在 manifest 声明
+  `required_slots`**；契约由 `tests/test_clarify_gate.py` 守护。
 - `settings.py` / `.env.example`：`INTENT_ROUTER_ENABLED`、`INTENT_*`、`JEV_*`，
   重试相关为 `JEV_MAX_RETRIES`（默认 2）和 `JEV_RETRY_BACKOFF_S`（默认 0.25）。
 - 测试：`tests/test_intent_jev.py`、`tests/test_intent_hybrid.py`、
@@ -304,7 +329,8 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
 | `llm` | `llm` | 无 | 无 |
 
 - `INTENT_PRIMARY / FALLBACK / SHADOW` 可覆盖预设；空值用预设，`none`/`off` 关闭该角色。
-- 默认阈值：置信度 `0.8`、margin `0.2`；低于阈值或 `needs_clarification` 时触发兜底。
+- 默认阈值：置信度 `0.8`、margin `0.2`；低于阈值或 `needs_clarification` 时触发兜底，
+  兜底后仍不确定则由 `ClarifyGate` 生成候选项进入 `clarify` 节点。
 - JEV 是英文优先模型；中文输入可开 `INTENT_TRANSLATE_TO_ENGLISH=true` 走 LLM 翻译。
   未开翻译时会记录 `cjk_without_translation` 警告。
 - 发送前先 `mask_pii` 再翻译/请求，PII 不离开本进程。
@@ -329,9 +355,14 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
 - SSE `classification` trace 新增：`engine`（`jev`/`llm`/`llm-prompt`）、
   `route`（domain/intent/confidence/margin/needs_clarification/fallback/warnings/shadow）、
   `route_error`。
+- `classify` 后追加 `plan` trace：`selected`（domain/intent/capability）、`basis`
+  （declared/fallback/redirect）、`missing_slots`、`needs_clarification`、
+  `needs_confirmation`；澄清落 `clarify` 时另发 `clarification_status`
+  （`status=asking`/`round`/`max_rounds`/`missing_slots`/`candidates`）。
 - 启用 JEV：先配 `JEV_API_KEY`，选 `INTENT_ENGINE=hybrid` 或 `jev`，用评测集对比
   准确率、兜底率和延迟后再放量；影子模式会与主路由并行，延迟取两者较慢值。
-- 当前对话图只在 trace / intent 事件里标记 `needs_clarification`，不强制打断。
+- `needs_clarification` 现在会由 `ClarifyGate` 决定是否进入 `clarify` 节点；这里没有
+  LangGraph `interrupt`/checkpointer，追问以 SSE 内容结束本轮，状态由前端 `round` 回传。
 
 意图评测：
 
@@ -478,6 +509,7 @@ returned=4
   tests/test_intent_router_integration.py \
   tests/test_capabilities.py \
   tests/test_confirmation_gate.py \
+  tests/test_clarify_gate.py \
   tests/test_template_boundary.py \
   tests/test_logging_setup.py
 
@@ -488,14 +520,14 @@ returned=4
 bash scripts/verify.sh
 ```
 
-当前基线（2026-11-25 写操作确认闸门后实跑）：
+当前基线（2026-11-25 澄清闸门 + plan trace 后实跑）：
 
-- 全量测试：`233 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派、
-  写操作确认闸门 11 条契约、内核边界门禁、P0 认证一致性回归；
-  跳过项为需真实 Milvus 的集成测试）。
+- 全量测试：`244 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派、
+  写操作确认闸门 11 条契约、澄清闸门 9 条契约、`/ready` 图声明校验、
+  内核边界门禁、P0 认证一致性回归；跳过项为需真实 Milvus 的集成测试）。
 - 模板相关契约：`tests/test_domain_plugin_template.py`、
   `tests/test_intent_plugin_template.py`、`tests/test_capabilities.py`、
-  `tests/test_confirmation_gate.py`、
+  `tests/test_confirmation_gate.py`、`tests/test_clarify_gate.py`、
   `tests/test_template_boundary.py`（改内核路由前必须先跑）。
 - 跳过项：`tests/test_milvus_integration.py`，需要真实 Milvus。
 - 已知无害日志：测试结束时 `milvus_lite` 可能打印
@@ -524,6 +556,8 @@ bash scripts/verify.sh
 - 不要提交 `.env`、`.data/`、`models/bge-*`、虚拟环境、密钥和临时产物；
   `vendor/pyyaml-*.whl` 是 Python 3.15 安装所需的例外，需要保留。
 - 日志和审计中的输入输出必须经过 `mask_pii`；不要把密钥、手机号、身份证、银行卡写入日志。
+- 新增需追问要素的意图必须在插件 manifest 声明 `required_slots` / `slot_labels`；新增有业务图的
+  插件必须声明 `graph_keys`；改 SSE 序列时同步前端静态节点与序列断言测试。
 - 修改行为、配置、接口、RAG 或意图链路时，同步更新：
   - `README.md`
   - `Architecture.md`
@@ -557,7 +591,8 @@ bash scripts/verify.sh
 - **对话编排已能力化，但工作台请求模型仍带示例形态**：`agents/assistant_agent.py` 与
   `app.py` 里不再有领域名或意图字符串，落点全部来自领域清单的 `capability`；
   但 `AssistantRequest.claim_id` / `material_round` 仍是示例理赔工作台的字段
-  （内核只透传，不解释），原创业务需要替换为自己的案件主键。
+  （内核只透传，不解释），通用澄清轮次新增 `round`（兼容 `material_round`，上限 3），
+  原创业务需要替换为自己的案件主键。
 - **HITL 中断跨进程会降级**：LangGraph 重启后 `tasks[].interrupts` 不再重建，
   只有 `snapshot.next` 保留。恢复门控与响应阶段必须用 `domains/base.py` 的
   `gate_resume(node=...)` / `resume_gate(...)` 按待执行节点重建，只看 `interrupt_kind`

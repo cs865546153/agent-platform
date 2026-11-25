@@ -2,6 +2,7 @@
 
 该模块不依赖 LangChain/FastAPI，领域包、评测脚本和测试都可以直接复用。
 """
+import re
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -10,6 +11,8 @@ RiskLevel = Literal["low", "medium", "high"]
 DomainMode = Literal["conversation", "case"]
 # 能力名是"对话编排处理器"的键：内核按名字分派，不认识任何领域概念。
 CAPABILITY_PATTERN = r"^[a-z][a-z0-9_]*$"
+# 槽位名由领域清单声明（如 policy_id）；内核只按名字核对是否缺失。
+SLOT_NAME_PATTERN = r"^[a-z][a-z0-9_]*$"
 
 # 意图路由子系统的统一 logger 命名空间：同一个子系统的日志必须落在一个名字下，
 # 否则按 logger 名做 grep / 告警会漏掉 jev 与 hybrid 的记录。
@@ -64,6 +67,23 @@ class IntentSpec(BaseModel):
     # 声明该意图会改变业务状态。内核的 ConfirmGate 据此拦截并引导到独立 API，
     # 即使领域已注册对话能力也不会在 SSE 链路里直接执行写操作。
     confirmation: ConfirmationSpec | None = None
+    # 命中该意图前必须补齐的槽位名；内核的 ClarifyGate 缺哪个问哪个。
+    # 槽位值仍由领域槽位抽取器/分类模型填充，内核不解释字段含义。
+    required_slots: list[str] = Field(default_factory=list, max_length=8)
+    # 面向用户的槽位文案（如 product_id -> 产品代码）；缺失时回退到槽位名。
+    slot_labels: dict[str, str] = Field(default_factory=dict, max_length=8)
+
+    @model_validator(mode="after")
+    def validate_slots(self) -> "IntentSpec":
+        for name in self.required_slots:
+            if not re.fullmatch(SLOT_NAME_PATTERN, name):
+                raise ValueError(f"非法槽位名：{name}")
+        if len(set(self.required_slots)) != len(self.required_slots):
+            raise ValueError(f"意图 {self.name} 存在重复 required_slots")
+        unknown = sorted(set(self.slot_labels) - set(self.required_slots))
+        if unknown:
+            raise ValueError(f"意图 {self.name} 的 slot_labels 含未声明槽位：{'、'.join(unknown)}")
+        return self
 
     def criteria_text(self) -> str:
         """返回给意图引擎的意图描述，优先英文。"""

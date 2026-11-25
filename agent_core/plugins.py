@@ -68,6 +68,8 @@ class DomainPlugin(Protocol):
     """领域插件协议。所有方法都是同步的，异步资源在 lifespan 内构建。"""
 
     name: str
+    # 可选：声明 build_graphs 会写入 ctx.graphs 的 key，供就绪探针核对。
+    graph_keys: tuple[str, ...]
 
     def build_services(self, ctx: AppContext, overrides: dict[str, Any]) -> None:
         """装配领域服务；``overrides`` 是测试注入的替身。"""

@@ -24,12 +24,14 @@ from langgraph.graph import END, START, StateGraph
 
 from agent_core.capabilities import (
     ANSWER_CAPABILITY,
+    CLARIFY_CAPABILITY,
     GUARD_CAPABILITY,
     AssistantCapabilities,
     AssistantHandler,
     capability_of,
     domain_of_intent,
 )
+from agent_core.clarification import ClarifyGate
 from agent_core.confirmation import ConfirmGate
 from agents.middleware_audit import mask_pii
 
@@ -46,6 +48,9 @@ GUARD_MESSAGE = (
     '这个请求会改变业务状态，模型不会直接执行。'
     '请按业务接口要求补齐要素，系统会先做校验，再要求二次确认并转授权人员审批。'
 )
+
+# 澄清裁决缺失 prompt 时的中性兜底：不写死任何业务话术。
+CLARIFY_MESSAGE = '为了准确处理你的请求，请补充更具体的信息。'
 
 # 分类结果不可用时的占位意图：它不属于任何领域清单，因此落点固定为内核 answer。
 UNROUTED_INTENT = '未识别'
@@ -83,6 +88,8 @@ class AssistantState(TypedDict, total=False):
     documents: list[Any]
     history: list[Any]
     material_round: int
+    # 通用澄清轮次（兼容旧前端的 material_round）；两类轮次语义独立。
+    round: int
     context: str
     started: float
     # 分类与路由结果
@@ -95,6 +102,8 @@ class AssistantState(TypedDict, total=False):
     route_evidence: dict[str, Any]
     # 写操作确认裁决（内核确定性产出，领域处理器与 guard 据此引导）
     confirmation: dict[str, Any]
+    # 澄清裁决（内核确定性产出，clarify 节点据此追问）
+    clarification: dict[str, Any]
     # 回答（由能力处理器装配，外层执行器负责流式）
     llm: Any
     messages: list[Any]
@@ -113,6 +122,8 @@ class RouteTarget:
     evidence: dict[str, Any] = field(default_factory=dict)
     # 写操作确认裁决（内核确定性产出）；非写操作为空 dict。
     confirmation: dict[str, Any] = field(default_factory=dict)
+    # 澄清裁决（内核确定性产出）；无需澄清时为空 dict。
+    clarification: dict[str, Any] = field(default_factory=dict)
 
 
 class IntentRoutingPolicy:
@@ -123,21 +134,27 @@ class IntentRoutingPolicy:
 
     ``confirm_gate`` 是写操作确认闸门：LLM 只提议意图，是否需确认、去哪个
     独立 API 由它确定性裁决；写操作意图绝不落到自由问答（``answer``）。
+
+    ``clarify_gate`` 是澄清闸门：低置信 / 缺必填槽位时先追问，优先级高于确认；
+    追问文案来自领域清单，不调用模型。
     """
 
     def __init__(self, registry: Any = None,
                  capabilities: AssistantCapabilities | None = None,
-                 confirm_gate: ConfirmGate | None = None) -> None:
+                 confirm_gate: ConfirmGate | None = None,
+                 clarify_gate: ClarifyGate | None = None) -> None:
         self.registry = registry
         self.capabilities = capabilities or AssistantCapabilities()
         self.confirm_gate = confirm_gate or ConfirmGate.from_registry(registry)
+        self.clarify_gate = clarify_gate or ClarifyGate.from_registry(registry)
 
     @classmethod
     def from_registry(cls, registry: Any,
                       capabilities: AssistantCapabilities | None = None,
-                      confirm_gate: ConfirmGate | None = None) -> "IntentRoutingPolicy":
+                      confirm_gate: ConfirmGate | None = None,
+                      clarify_gate: ClarifyGate | None = None) -> "IntentRoutingPolicy":
         """从 ``DomainRegistry`` 派生策略；``None`` 表示只用内核内置能力。"""
-        return cls(registry, capabilities, confirm_gate)
+        return cls(registry, capabilities, confirm_gate, clarify_gate)
 
     def domain_for(self, intent: str | None, *, fallback: str | None = None) -> str:
         """意图归属的领域；清单反查不到时用路由结果里的领域名，再退到 general。"""
@@ -159,6 +176,15 @@ class IntentRoutingPolicy:
             base = RouteTarget(domain or 'general', capability, handler)
 
         decision = self.confirm_gate.decide(base.domain, intent)
+        # 澄清先于确认：要素都没补齐时先问清楚，问完再走确认闸门。
+        clarification = self.clarify_gate.decide(
+            base.domain, intent, state, write_operation=decision.required,
+        )
+        if clarification.required:
+            handler = self.capabilities.get(CLARIFY_CAPABILITY)
+            return RouteTarget(base.domain, CLARIFY_CAPABILITY, handler, base.evidence,
+                               decision.as_dict() if decision.required else {},
+                               clarification.as_dict())
         enforced = self.confirm_gate.enforce(base.capability, decision)
         handler = (self.capabilities.get(enforced) if enforced != base.capability
                    else base.handler)
@@ -356,8 +382,26 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
         target = policy.resolve(
             route_domain, intent.intent,
             {**state, 'intent': intent.intent, 'confidence': intent.confidence,
-             'slots': slots, 'documents': state['documents']},
+             'slots': slots, 'documents': state['documents'],
+             # 澄清闸门的输入：低置信标记与候选概率只来自路由层，内核不猜。
+             'needs_clarification': bool(getattr(decision, 'needs_clarification', False)),
+             'intent_probabilities': dict(getattr(decision, 'intent_probabilities', {}) or {})},
         )
+        events.append({'trace': {
+            'node': 'plan', 'status': 'done',
+            'input': {'intent': intent.intent, 'confidence': intent.confidence,
+                      'needs_clarification': bool(
+                          getattr(decision, 'needs_clarification', False))},
+            'output': {
+                'selected': {'domain': target.domain, 'intent': intent.intent,
+                             'capability': target.capability},
+                'basis': ('redirect' if target.evidence
+                          else 'declared' if declared else 'fallback'),
+                'missing_slots': list((target.clarification or {}).get('missing_slots') or []),
+                'needs_clarification': bool((target.clarification or {}).get('required')),
+                'needs_confirmation': bool((target.confirmation or {}).get('required')),
+            },
+        }})
         events.append({'trace': {'node': 'route', 'status': 'done', 'selected': target.domain,
                                  'input': intent.model_dump() | target.evidence,
                                  'output': {'selected': target.domain,
@@ -367,6 +411,7 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
         return {'intent': intent.intent, 'confidence': intent.confidence, 'slots': slots,
                 'domain': target.domain, 'capability': target.capability, 'stage': target.domain,
                 'route_evidence': target.evidence, 'confirmation': target.confirmation,
+                'clarification': target.clarification,
                 'events': events}
 
     async def answer(state: dict[str, Any]) -> dict[str, Any]:
@@ -407,13 +452,51 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
             'needs_llm_answer': False,
         }
 
+    async def clarify(state: dict[str, Any]) -> dict[str, Any]:
+        """内核统一追问：低置信或缺必填槽位时，用清单文案向用户澄清。
+
+        不调用任何模型；问题文本由 ``ClarifyGate`` 从领域清单与路由概率派生。
+        追问阶段同样声明"不执行"，避免写操作被误解为已受理。
+        """
+        node = state.get('stage') or CLARIFY_CAPABILITY
+        decision = state.get('clarification') or {}
+        confirmation = state.get('confirmation') or {}
+        prompt = decision.get('prompt') or CLARIFY_MESSAGE
+        missing = list(decision.get('missing_slots') or [])
+        candidates = list(decision.get('candidates') or [])
+        output = {
+            'executed': False,
+            'requires_confirmation': bool(confirmation.get('required')),
+            'requires_human_review': bool(
+                confirmation.get('required') and confirmation.get('requires_human_review', True)
+            ),
+            'clarification': decision,
+        }
+        events: list[dict[str, Any]] = [
+            {'trace': {'node': node, 'status': 'running',
+                       'summary': '需要澄清或补充要素',
+                       'input': {'intent': state['intent'], 'capability': state.get('capability'),
+                                 'missing_slots': missing, 'candidates': candidates}}},
+            {'trace': {'node': node, 'status': 'done', 'output': output}},
+            {'content': prompt},
+            {'clarification_status': {
+                'status': 'asking',
+                'round': decision.get('round'),
+                'max_rounds': decision.get('max_rounds'),
+                'missing_slots': missing,
+                'candidates': candidates,
+            }},
+        ]
+        return {'events': events, 'needs_llm_answer': False}
+
     # 补齐内置能力后的注册表同时供分派与建节点使用：改写钩子、清单落点和图节点
     # 因此看到同一份能力表。内置能力不覆盖领域已注册的同名实现。
-    available = capabilities.with_kernel(answer=answer, guard=guard)
+    available = capabilities.with_kernel(answer=answer, guard=guard, clarify=clarify)
     # 保留装配期注入的确认闸门：显式构造的 ConfirmGate 不能被默认派生覆盖，
     # 否则 create_app 传入的自定义裁决规则会静默失效。
     policy = IntentRoutingPolicy.from_registry(
         registry, available, confirm_gate=base.confirm_gate,
+        clarify_gate=base.clarify_gate,
     )
     node_names = available.names()
 
@@ -471,6 +554,7 @@ def _capability_node(capability: str, handler: AssistantHandler) -> Any:
 
 
 __all__ = [
+    "CLARIFY_MESSAGE",
     "GENERAL_PROMPT",
     "GUARD_MESSAGE",
     "INTENT_PROMPT",

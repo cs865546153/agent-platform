@@ -413,7 +413,9 @@ margin     >= 0.2
 - `confidence` 低于阈值 → `needs_clarification = true`
 - 第一候选与第二候选的差值 `margin` 太小 → 也视为不确定
 - `hybrid` 模式下低置信会触发 LLM 兜底；兜底后仍不确定则保留 `needs_clarification`
-- 当前对话图只把该标记写入 trace / intent 事件，不强制打断；需要澄清时由业务节点追问
+- `needs_clarification` 会进入 `ClarifyGate`：与 manifest 的 `required_slots` 一起决定是走
+  内核 `clarify` 节点（确定性追问）还是原业务节点；这里没有 LangGraph `interrupt`，
+  追问以 SSE 内容 + `clarification_status` 结束本轮，不持久化会话状态
 
 可通过以下环境变量调整：
 
@@ -514,8 +516,9 @@ ObjectStore:  Local    → S3 / OSS
 | 路径 | 作用 |
 |---|---|
 | `app.py` | FastAPI 入口、SSE、理赔接口；启动时 `build_assistant_intent_router()` |
-| `agents/assistant_agent.py` | 领域无关的对话编排图：`classify`（意图路由 + 清单校验）→ 按 `capability` 分派 |
-| `agent_core/capabilities.py` | 对话编排能力表：内置 `answer` / `guard`，其余由领域注册；`missing_handlers` 供启动校验 |
+| `agents/assistant_agent.py` | 领域无关的对话编排图：`classify`（意图路由 + 清单校验）→ `plan` trace → 按 `capability` 分派 |
+| `agent_core/capabilities.py` | 对话编排能力表：内置 `answer` / `guard` / `clarify`，其余由领域注册；`missing_handlers` 供启动校验 |
+| `agent_core/clarification.py` | 澄清闸门：按 `required_slots` / `needs_clarification` 确定性裁决，文案来自 manifest |
 | `domains/*/assistant_handlers.py` | 领域侧对话能力实现（保单查询、材料门控、核赔、投资 RAG、交易拦截） |
 | `agents/claim_agent.py` | 理赔案件状态机、三专家、`route_decision` |
 | `agents/middleware_audit.py` | PII 脱敏、限流、缓存、审计、HITL |

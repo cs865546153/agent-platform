@@ -46,6 +46,12 @@ intents:
     risk: high
     mode: case
     capability: trade_gate
+    # 缺这些要素时内核 ClarifyGate 先用清单文案追问，处理器不再写死追问话术。
+    required_slots: [product_id, amount, risk_profile]
+    slot_labels:
+      product_id: 产品代码
+      amount: 交易金额
+      risk_profile: 风险承受能力
     # 写操作契约：对话链路只拦截引导，真正执行走独立 API 的二次确认 + 人工审批。
     # ConfirmGate 据此做确定性裁决，不依赖模型判断"要不要确认"。
     confirmation:

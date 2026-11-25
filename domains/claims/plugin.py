@@ -42,6 +42,7 @@ def extract_claim_slots(decision: Any, question: str, turns: list[Any]) -> dict[
 class ClaimsPlugin(DomainPluginBase):
     name = "claims"
     tags = ["理赔域"]
+    graph_keys = ("claims",)
 
     def build_services(self, ctx: AppContext, overrides: dict[str, Any]) -> None:
         from adapters.business import BusinessBackend, DemoBackend

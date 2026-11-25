@@ -21,9 +21,8 @@ from monitoring import ERRORS
 from prompts.investment_prompt import INVESTMENT_ADVISOR_PROMPT, INVESTMENT_RAG_USAGE_PROMPT
 
 TRADE_GATE_MESSAGE = (
-    '交易指令不会由模型直接执行。请提供产品代码、交易金额和风险承受能力；'
-    '系统会先做适当性校验，再要求你二次确认，并转授权人员审批。'
-    '在审批完成前不会下单。'
+    '该操作不会由模型直接执行。系统会先做适当性校验，再要求你二次确认，'
+    '并转授权人员审批；在审批完成前不会下单。'
 )
 
 
