@@ -104,6 +104,8 @@ class AssistantState(TypedDict, total=False):
     confirmation: dict[str, Any]
     # 澄清裁决（内核确定性产出，clarify 节点据此追问）
     clarification: dict[str, Any]
+    # 执行面策略注册表（领域可覆盖循环/上下文/工具/预算）；由 app 装配时注入。
+    harnesses: Any
     # 回答（由能力处理器装配，外层执行器负责流式）
     llm: Any
     messages: list[Any]

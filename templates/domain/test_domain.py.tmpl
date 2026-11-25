@@ -1,0 +1,15 @@
+"""生成的领域骨架冒烟：装配、就绪与能力注册。"""
+from fastapi.testclient import TestClient
+
+from agent_core.plugins import PluginRegistry
+from app import create_app
+from domains.$name.plugin import ${class_name}Plugin
+
+
+def test_generated_domain_assembles() -> None:
+    with TestClient(create_app(
+        database=':memory:',
+        registry=PluginRegistry([${class_name}Plugin()]),
+    )) as client:
+        assert client.get('/health').status_code == 200
+        assert client.get('/ready').status_code == 200

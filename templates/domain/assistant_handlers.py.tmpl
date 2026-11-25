@@ -1,0 +1,34 @@
+"""${description}的对话能力：默认只做一次领域回答，可按需替换。"""
+from __future__ import annotations
+
+from typing import Any
+
+from agents.assistant_agent import conversation_messages, model_inputs
+
+PROMPT = (
+    '你是${description}助手。只回答本领域问题；信息不足时先追问，无法确认时建议转人工。'
+    '不要编造业务数据或承诺未实现的能力。'
+)
+
+
+def build_${name}_handlers(*, service: Any, model: Any) -> dict[str, Any]:
+    async def ${capability}(state: dict[str, Any]) -> dict[str, Any]:
+        messages = conversation_messages(state['question'], state['history'], PROMPT)
+        return {
+            'events': [{'trace': {'node': '$name', 'status': 'done',
+                                  'summary': service.describe(state['question']),
+                                  'input': model_inputs(model, messages)}}],
+            'llm': model,
+            'messages': messages,
+            'needs_llm_answer': True,
+        }
+
+    return {'$capability': $capability}
+
+
+def register_${name}_capabilities(ctx: Any, *, service: Any, model: Any) -> None:
+    for capability, handler in build_${name}_handlers(service=service, model=model).items():
+        ctx.capabilities.register(capability, handler)
+
+
+__all__ = ['build_${name}_handlers', 'register_${name}_capabilities']

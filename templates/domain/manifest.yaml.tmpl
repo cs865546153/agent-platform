@@ -1,0 +1,16 @@
+# 由 scripts/create_domain.py 生成的领域声明；占位符已在生成时替换。
+# 意图与能力是新增领域的事实源：内核按 capability 分派，不认识具体业务。
+name: $name
+description: $description_yaml
+description_en: $description_en_yaml
+version: 0.1.0
+capabilities: [$capability]
+intents:
+  - name: $intent_yaml
+    description: $intent_description_yaml
+    description_en: $intent_description_en_yaml
+    examples:
+      - $example_yaml
+    risk: low
+    mode: conversation
+    capability: $capability

@@ -1,0 +1,44 @@
+"""${description}领域插件：装配服务与对话能力。
+
+生成后把 ${class_name}Service 替换成真实适配器；插件只负责生命周期编排，
+不要 import app.py，也不要修改 agent_core。
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from agent_core.plugins import AppContext
+from domains.base import DomainPluginBase
+
+
+class ${class_name}Service:
+    """领域服务占位：真实项目里替换成业务适配器或领域模型。"""
+
+    @staticmethod
+    def describe(question: str) -> str:
+        return f'${name} 领域已收到请求：{question}'
+
+
+class ${class_name}Plugin(DomainPluginBase):
+    name = '$name'
+    tags = ['$name']
+
+    def build_services(self, ctx: AppContext, overrides: dict[str, Any]) -> None:
+        from config import get_model
+        from domains.$name.assistant_handlers import register_${name}_capabilities
+
+        service = overrides.get('${name}_service') or ${class_name}Service()
+        ctx.services[self.name] = service
+        register_${name}_capabilities(
+            ctx,
+            service=service,
+            model=ctx.models.get('customer_service') or get_model('customer_service'),
+        )
+
+    def register_routes(self, ctx: AppContext) -> None:
+        from domains.$name.routes import register_routes
+
+        register_routes(ctx)
+
+
+__all__ = ['${class_name}Plugin', '${class_name}Service']

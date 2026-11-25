@@ -11,14 +11,17 @@
 ## 1. 分层与边界
 
 ```
-app.py                     内核：FastAPI 装配 + 通用路由（health/ready/metrics/RAG/工作台/SSE）
-  └─ create_app(registry=)  唯一扩展点：注入领域插件集；顶层不 import 任何领域类型
+app.py                     组合根：默认领域 → create_app(registry=default_registry())
+app_factory.py             平台装配：FastAPI 路由 + lifespan + SSE + 工作台（不 import 领域）
+  └─ create_app(registry=)  唯一扩展点：注入领域插件集
      └─ overrides / models  领域依赖注入点，键名由插件解释（内核签名无领域名）
+apps/                      薄应用入口：claims_app / investment_app / unified_app
 agent_core/                领域无关内核
   ├─ plugins.py            DomainPlugin 协议（intent_manifest）、AppContext（slot_extractors/capabilities）、PluginRegistry
   ├─ capabilities.py       对话编排能力注册表：内核按"能力名"分派，只内置 answer / guard / clarify
   ├─ confirmation.py       写操作确认闸门：按清单确定性裁决，写操作绝不落到自由问答
   ├─ clarification.py      澄清闸门：required_slots / 低置信候选，确定性追问且不调用模型
+  ├─ harness/              执行面策略：Harness + 循环/上下文/工具/预算，领域可按需覆盖
   ├─ security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容旧部署）
   ├─ sse.py                SSE 帧编码（已接入 app.py，无内联副本）
   └─ intent/               JEV/LLM/Hybrid/Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
@@ -28,12 +31,24 @@ domains/                   领域插件（可增删）
   ├─ claims/               示例域：理赔状态机、三专家、RAG、HITL、演示路由、对话能力与保单号槽位规则
   ├─ investment/           示例域：投资咨询、交易二次确认、人工审批、对话能力与投资 RAG 装配
   └─ example/              最小示例：60 行接入一个新领域（可直接抄改）
+templates/domain/          create-domain 脚手架：manifest / plugin / handlers / routes / 冒烟测试
 configs/domains.yaml       运行时回退清单：只保留无插件领域（general）
 ```
 
 **横切能力**（审计哈希链、接入限流、PII 脱敏、模型缓存/降级、Prometheus/LangFuse）
 在 `agents/http_middleware.py`、`agents/audit_store.py`、`agents/middleware_audit.py` 等，
 对所有领域一律生效，领域插件无需重复实现。
+
+**按助手裁剪**：一个仓库可以同时产出多个助手，入口只决定装配哪些领域。
+
+```bash
+.venv-py315/bin/uvicorn app:app --port 8001                 # 统一工作台（默认）
+.venv-py315/bin/uvicorn apps.claims_app:app --port 8001     # 只装理赔域
+.venv-py315/bin/uvicorn apps.investment_app:app --port 8002 # 只装投资域
+```
+
+`apps/*_app.py` 只是 `create_app(registry=PluginRegistry([...]))` 的薄组合根；
+未装配领域的路由、对话能力与图都不会注册，测试见 `tests/test_app_shells.py`。
 
 ---
 
@@ -49,9 +64,10 @@ configs/domains.yaml       运行时回退清单：只保留无插件领域（ge
 | 对话编排能力分派 | `agent_core/capabilities.py` + `agents/assistant_agent.py` 动态建图 | 在 `build_services` 里 `ctx.capabilities.register(名字, handler)` |
 | 写操作确认闸门 | `agent_core/confirmation.py`（`ConfirmGate` 确定性裁决） | 写操作意图在 manifest 声明 `confirmation`（指向独立 API）；内核自动拦截并引导，不执行动作 |
 | 澄清闸门 | `agent_core/clarification.py`（`ClarifyGate` 确定性裁决） | 需要要素的意图在 manifest 声明 `required_slots` / `slot_labels`；缺槽位或低置信由内核 `clarify` 追问 |
+| 执行面策略 | `agent_core/harness/`（`Harness` + `LoopPolicy` / `ContextPolicy` / `ToolPolicy` / `BudgetPolicy`） | 需要不同循环或上下文裁剪时，在 `build_services` 写 `ctx.harnesses.register('my_domain', Harness(...))` |
 | 多路召回 + RRF + BGE-Rerank + 引用校验 | `tools/knowledge_rag.py`、`tools/rerank.py` | 可选复用 |
 | HITL（中断 + 恢复 + 人工审批） | LangGraph `interrupt` + `domains/base.py:gate_resume/resume_gate` | 图内声明中断，恢复门控用基类 |
-| SSE 流式回答 | `app.py` assistant 路由 + `agent_core/sse.py` | 否 |
+| SSE 流式回答 | `app_factory.py` assistant 路由 + `agent_core/sse.py` | 否 |
 | Prometheus / LangFuse / 日志脱敏 | `monitoring.py`（`METRIC_PREFIX` 可配、插件可 `register_counter`）、`agents/observability.py` | 否 |
 | 上线门禁 / 影子对拍 | `deploy/regression_gate.py`、`deploy/shadow_mode.py` | 否 |
 
@@ -59,7 +75,19 @@ configs/domains.yaml       运行时回退清单：只保留无插件领域（ge
 
 ## 3. 新增一个领域（五步）
 
-以 `domains/example/` 为骨架：
+最快路径是用脚手架生成骨架，再改业务实现：
+
+```bash
+.venv-py315/bin/python -m scripts.create_domain wealth \
+  --description "财富管理" \
+  --description-en "Wealth management" \
+  --intent "财富咨询" \
+  --example "帮我看看资产配置"
+```
+
+生成 `domains/wealth/`（manifest / plugin / handlers / routes）与 `tests/test_wealth_domain.py`；
+在 `domains/registry.py` 登记后即可被 `/api/assistant/stream` 路由。下面是手写等价流程，
+需要完全控制文件结构时参考 `domains/example/`：
 
 ### 步骤 1：实现插件
 
@@ -183,6 +211,23 @@ def register_my_capabilities(ctx, *, model) -> None:
 - 有业务图的插件在 `DomainPluginBase` 声明 `graph_keys`（如 `("claims",)`），
   `/ready` 会据此检查装配是否完整；跳过该字段的纯能力插件不受影响。
 
+执行面需要不同的循环或上下文裁剪时，在 `build_services` 里注册领域自己的 Harness：
+
+```python
+from agent_core.harness import ContextPolicy, Harness, HarnessHooks, LoopPolicy
+
+ctx.harnesses.register('my_domain', Harness(
+    loop=LoopPolicy(max_steps=6, deadline_s=30),
+    context=ContextPolicy(max_tokens=8_000),
+    hooks=HarnessHooks(before_model=my_context_builder),
+))
+```
+
+处理器可以从 `state['harnesses']` 取到注册表；未注册的领域使用默认策略，
+默认策略不改变现有 SSE 事件序列。要接管整套执行（而非只换策略），继承 `Harness`
+并重写 `stream_answer` / `run_graph` 即可。应用层也可用
+`create_app(harnesses={'my_domain': ...}, assistant_harness=...)` 注入。
+
 ### 步骤 4：登记领域
 
 ```python
@@ -215,7 +260,7 @@ pytest -q                                        # 全量
 ## 4. 模板的使用边界（如实说明）
 
 - **演示路由已迁出内核**：`/api/demo/claims/*` 由 `ClaimsPlugin` 注册，不装 claims 插件就不存在；
-  `app.py` 只保留通用路由与 assistant 对话编排，原创业务可删除后者，不影响领域插件机制。
+  `app_factory.py` 只保留通用路由与 assistant 对话编排，原创业务可删除后者，不影响领域插件机制。
 - **对话编排已按能力分派**：`agents/assistant_agent.py` 不再有业务节点或意图字符串，
   图节点由"已注册的能力名"动态生成，落点来自领域清单的 `capability`。
   新增领域按步骤 2/3 声明并注册后，在 `/api/assistant/stream` 自动可达，无需改内核。
@@ -235,19 +280,22 @@ pytest -q                                        # 全量
 - **真实联调未完成**：本地 LLM、Milvus、Redis、LangFuse、核心业务系统需按部署环境接入；
   模板不虚构准确率、延迟或成本。详见 `docs/` 各专题与 `deploy/runbook.md`。
 - **进程内限流/锁**：多副本部署需替换为 Redis；`AppContext.locks` 是进程内实现。
-- **关于 Harness**：材料中的 `deep_agents.Harness/Fuse/Memory/AgenticRAG` 未被官方 SDK 证实，
-  本项目主链路使用 LangGraph 显式状态机；`isolated_deep/` 里用官方
-  `create_deep_agent`/subagents 做了隔离验证的等价替代，**主 app 未接入**。
+- **关于 Harness**：本项目新增的 `agent_core/harness/` 是**执行面策略**（循环/上下文/
+  工具/预算），与培训材料里未被官方 SDK 证实的 `deep_agents.Harness` 不是同一概念；
+  主链路仍使用 LangGraph 显式状态机，`isolated_deep/` 里的官方 `create_deep_agent`
+  隔离验证**主 app 未接入**。
 
 ---
 
 ## 5. 验证基线（2026-11-25）
 
-- `244 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；写操作确认闸门 11 条
+- `258 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；写操作确认闸门 11 条
   契约 + 澄清闸门 9 条契约（槽位 / 意图候选 / 轮次上限 / 优先级 / 图内追问 / 清单声明）
+  + 执行面 harness 7 条契约 + create-domain 脚手架 4 条契约 + 薄应用入口 3 条契约
 - Ruff 本次改动文件全部通过
 - 可插拔契约由 `tests/test_domain_plugin_template.py`、`tests/test_intent_plugin_template.py`、
   `tests/test_capabilities.py`、`tests/test_confirmation_gate.py`、`tests/test_clarify_gate.py`、
+  `tests/test_harness.py`、`tests/test_create_domain.py`、`tests/test_app_shells.py`、
   `tests/test_template_boundary.py` 守护
 - 真实装配冒烟：`/health`、`/ready`、`/openapi.json` 均 200，19 条路由全部注册；
   `/ready` 额外校验插件 `graph_keys` 声明的 `claims` / `investment` 两张图；

@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # 真正的内核文件。domains/registry.py 是"启用哪些领域"的登记表，允许出现领域名。
 KERNEL_FILES = [
     'app.py',
+    'app_factory.py',
     'agents/assistant_agent.py',
     'agent_core/capabilities.py',
     'agent_core/plugins.py',
@@ -25,7 +26,8 @@ KERNEL_FILES = [
     'agent_core/sse.py',
     'domains/base.py',
     'models/workbench.py',
-] + [f'agent_core/intent/{path.name}' for path in (ROOT / 'agent_core' / 'intent').glob('*.py')]
+] + [f'agent_core/intent/{path.name}' for path in (ROOT / 'agent_core' / 'intent').glob('*.py')] \
+  + [f'agent_core/harness/{path.name}' for path in (ROOT / 'agent_core' / 'harness').glob('*.py')]
 
 # 意图字符串只属于领域清单（manifest.yaml / DomainManifest）。
 INTENT_STRINGS = [

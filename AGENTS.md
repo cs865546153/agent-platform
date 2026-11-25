@@ -44,7 +44,9 @@ FastAPI
 ## 目录
 
 ```text
-app.py                  FastAPI 路由、lifespan、SSE、工作台接口
+app.py                  应用入口：组合默认领域（create_app + default_registry）
+app_factory.py          通用 FastAPI 装配、lifespan、SSE、工作台接口
+apps/                   薄应用入口：claims / investment / unified，按需裁剪领域
 settings.py             Pydantic 环境配置、URL/密钥校验
 config.py               模型工厂、任务档位路由、LangChain 模型缓存
 logging_setup.py        日志、请求 ID、轮转、脱敏
@@ -84,6 +86,7 @@ agent_core/             领域无关内核
   security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容）、生产密钥校验
   sse.py                SSE 帧编码（app.py 已接入）
   intent/               意图路由公共层：JEV / LLM / Hybrid / Registry / adapter
+  harness/              执行面策略：Harness + 循环/上下文/工具/预算 + 按领域注册表
 domains/                领域插件（可增删，新增领域不改内核）
   registry.py           默认领域登记表（唯一"启用哪些领域"的事实源）
   base.py               插件基类 + LangGraph 中断/配置/HITL 恢复门控共用辅助
@@ -96,7 +99,8 @@ models/                 领域无关模型（Pydantic / 工作台）+ 本地 BGE
 data/investment_wiki/   投资 Wiki 源文件（约 55 chunks）
 data/knowledge_base/    通用知识库源文件（当前约 3 chunks）
 data/intent_golden.jsonl 意图评测集（39 条合成样本）
-scripts/                启动、建索引、评测、验证、embed 服务、VPS 部署
+scripts/                启动、建索引、评测、验证、embed 服务、VPS 部署、create_domain 脚手架
+templates/domain/       新领域骨架（manifest / plugin / handlers / routes / 冒烟测试）
 docs/                   架构、RAG、结构化输出、平台工作流说明
 demos/                  链路图、状态机图、模块演示
 deploy/                 回归门禁、shadow 对拍、监控告警、runbook
@@ -119,7 +123,18 @@ bash scripts/start_mac.sh
 ```
 
 脚本会优先使用 `.venv-py315`，默认 `8001`，开发热重载开启；可用
-`bash scripts/start_mac.sh 8002` 指定端口，`--no-reload` 关闭热重载。
+`bash scripts/start_mac.sh 8002` 指定端口，`--no-reload` 关闭热重载；
+`bash scripts/start_mac.sh --app=apps.claims_app:app` 只装理赔领域。
+
+按助手裁剪入口（不启动不需要的领域）：
+
+```bash
+.venv-py315/bin/uvicorn apps.claims_app:app --host 127.0.0.1 --port 8001
+.venv-py315/bin/uvicorn apps.investment_app:app --host 127.0.0.1 --port 8002
+.venv-py315/bin/uvicorn apps.unified_app:app --host 127.0.0.1 --port 8003
+```
+
+`app.py` 仍等价于 `apps.unified_app`，是工作台默认入口。
 
 Embedding / Reranker 服务：
 
@@ -312,6 +327,14 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
   槽位级优先（缺什么问什么）、意图级其次（清单 `description` 生成候选项），
   优先级高于确认闸门，文案不写死在内核。**新增需追问要素的意图必须在 manifest 声明
   `required_slots`**；契约由 `tests/test_clarify_gate.py` 守护。
+- `agent_core/harness/`：执行面策略。`Harness` 默认只做"裁剪消息 → 模型流式 → 内容钩子"，
+  并提供 `LoopPolicy`（步数/工具次数/截止时间）、`ContextPolicy`（条数/token 预算，
+  保留 system）、`ToolPolicy`（白名单/黑名单/调用上限）、`BudgetPolicy`（token/成本/秒）、
+  `HarnessHooks`（before_model / on_chunk / on_event）。`HarnessRegistry` 按域名查找，
+  未注册用默认策略。接入点：`create_app(harnesses={'claims': ...}, assistant_harness=...)`，
+  或插件在 `build_services` 写 `ctx.harnesses`；对话处理器可从 `state['harnesses']` 取。
+  领域只换一个维度时改 policy，要接管整套循环则继承 `Harness` 重写 `stream_answer` /
+  `run_graph`。默认策略不改变现有 SSE 事件序列；契约由 `tests/test_harness.py` 守护。
 - `settings.py` / `.env.example`：`INTENT_ROUTER_ENABLED`、`INTENT_*`、`JEV_*`，
   重试相关为 `JEV_MAX_RETRIES`（默认 2）和 `JEV_RETRY_BACKOFF_S`（默认 0.25）。
 - 测试：`tests/test_intent_jev.py`、`tests/test_intent_hybrid.py`、
@@ -510,6 +533,9 @@ returned=4
   tests/test_capabilities.py \
   tests/test_confirmation_gate.py \
   tests/test_clarify_gate.py \
+  tests/test_harness.py \
+  tests/test_create_domain.py \
+  tests/test_app_shells.py \
   tests/test_template_boundary.py \
   tests/test_logging_setup.py
 
@@ -520,14 +546,16 @@ returned=4
 bash scripts/verify.sh
 ```
 
-当前基线（2026-11-25 澄清闸门 + plan trace 后实跑）：
+当前基线（2026-11-25 执行面 harness 接入后实跑）：
 
-- 全量测试：`244 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派、
-  写操作确认闸门 11 条契约、澄清闸门 9 条契约、`/ready` 图声明校验、
-  内核边界门禁、P0 认证一致性回归；跳过项为需真实 Milvus 的集成测试）。
+- 全量测试：`258 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派、
+  写操作确认闸门 11 条契约、澄清闸门 9 条契约、执行面 harness 7 条契约、
+  create-domain 脚手架 4 条契约、薄应用入口 3 条契约、`/ready` 图声明校验、内核边界门禁、
+  P0 认证一致性回归；跳过项为需真实 Milvus 的集成测试）。
 - 模板相关契约：`tests/test_domain_plugin_template.py`、
   `tests/test_intent_plugin_template.py`、`tests/test_capabilities.py`、
   `tests/test_confirmation_gate.py`、`tests/test_clarify_gate.py`、
+  `tests/test_harness.py`、`tests/test_create_domain.py`、`tests/test_app_shells.py`、
   `tests/test_template_boundary.py`（改内核路由前必须先跑）。
 - 跳过项：`tests/test_milvus_integration.py`，需要真实 Milvus。
 - 已知无害日志：测试结束时 `milvus_lite` 可能打印
@@ -556,8 +584,11 @@ bash scripts/verify.sh
 - 不要提交 `.env`、`.data/`、`models/bge-*`、虚拟环境、密钥和临时产物；
   `vendor/pyyaml-*.whl` 是 Python 3.15 安装所需的例外，需要保留。
 - 日志和审计中的输入输出必须经过 `mask_pii`；不要把密钥、手机号、身份证、银行卡写入日志。
+- 新增领域优先用脚手架：`.venv-py315/bin/python -m scripts.create_domain <name> --description "..."`，
+  生成 `domains/<name>/` 与冒烟测试；再按需补 manifest / handler / 路由。
 - 新增需追问要素的意图必须在插件 manifest 声明 `required_slots` / `slot_labels`；新增有业务图的
-  插件必须声明 `graph_keys`；改 SSE 序列时同步前端静态节点与序列断言测试。
+  插件必须声明 `graph_keys`；需要不同循环/上下文裁剪的领域在 `build_services` 注册
+  `ctx.harnesses`；改 SSE 序列时同步前端静态节点与序列断言测试。
 - 修改行为、配置、接口、RAG 或意图链路时，同步更新：
   - `README.md`
   - `Architecture.md`
@@ -607,6 +638,25 @@ bash scripts/verify.sh
 - **线上安全**：仍是 development + nginx Basic Auth，需换默认口令、补 nginx 限流、
   SSH 密钥、日志轮转、`.data` 备份和外部监控。
 - **CI/CD 未统一**：工作流与 `scripts/deploy_vps.sh` 的 rsync 流程不一致，需要二选一。
+
+## 后续规划（未完成，按优先级）
+
+1. **`packages/` 拆包（P1）**
+   - 目标：把 `app_factory.py`、`agents/`、`tools/`、`models/` 收拢到 `packages/`（或 `src/` 布局），
+     `app.py` / `apps/*` 只保留组合根；先留兼容导入壳，分两步迁移，避免一次性打断现有测试。
+   - 验收：全量测试与 `scripts/verify.sh` 通过；`import app`、`apps.claims_app`、
+     `uvicorn app:app` 与 `uvicorn apps.*:app` 均可用；文档同步更新路径。
+2. **领域级配置与数据隔离（P1）**
+   - 现状：`investment_rag_*` 等示例领域配置仍在全局 `Settings`，`.data/` 也是全局路径；
+     同时启动多个助手会共享检查点、审计、outbox 与向量库。
+   - 目标：插件声明/读取自己的配置前缀（如 `INVESTMENT_*` / `CLAIMS_*`），应用入口可覆盖
+     checkpoint / audit / outbox / vector 路径；未声明时回退全局默认，保持单助手兼容。
+   - 验收：`apps.claims_app` 与 `apps.investment_app` 可用不同 `.data` 目录并行启动；
+     新增配置隔离与路径隔离契约测试；`AGENTS.md`、`TEMPLATE.md`、`README.md` 同步。
+3. **可选增强（P2）**
+   - RAG golden QA 与 Recall@K / MRR / nDCG / 引用准确率回归；
+   - 真实理赔适配器闭环（保单查询、单证核验、回写/通知）；
+   - CI/CD 二选一（GitHub Actions 与 `scripts/deploy_vps.sh` 对齐）。
 
 ## 关键文档
 

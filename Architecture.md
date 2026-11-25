@@ -22,9 +22,9 @@
   审计：脱敏入参 + RAG 检索诊断写入 audit.sqlite，只追加 + 哈希链
        |
        v
-【内核装配层】 app.py (FastAPI) —— 唯一扩展点 create_app(registry=)
+【内核装配层】 app_factory.py (FastAPI) —— 唯一扩展点 create_app(registry=)；app.py/apps/* 是组合根
   通用路由：/health · /ready · /metrics · /api/rag/* · /api/assistant/stream · /api/documents/analyze
-  领域路由：由 domains/<域>/routes.py 注册，app.py 不认识具体业务
+  领域路由：由 domains/<域>/routes.py 注册，装配层不认识具体业务
   演示路由：/api/demo/claims/* 由 ClaimsPlugin 注册（不装 claims 插件即不存在）
        |
        |  lifespan 中按 registry 装配 AppContext
@@ -43,6 +43,7 @@
   capabilities.py : 对话编排能力表（内核只内置 answer / guard / clarify，其余由领域注册）
   confirmation.py : 写操作确认闸门（按清单确定性裁决，写操作绝不落自由问答）
   clarification.py : 澄清闸门（required_slots / 低置信候选，确定性追问，不调用模型）
+  harness/    : 执行面策略（Harness + 循环/上下文/工具/预算），领域可按域名覆盖
   security.py : 统一认证与生产密钥校验；sse.py : SSE 帧编码（app.py 已接入）
   intent/     : JEV / LLM / Hybrid / Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
        |
@@ -105,8 +106,8 @@
 
 | 层 | 位置 | 职责 | 是否认识业务 |
 |---|---|---|---|
-| 内核装配 | `app.py` | `create_app(registry=)` 装配全局、注册通用路由、提供 lifespan | 否（只认插件协议） |
-| 内核能力 | `agent_core/` | plugins 契约、认证、SSE、意图路由框架 | 否 |
+| 内核装配 | `app_factory.py`（组合根 `app.py` / `apps/*`） | `create_app(registry=)` 装配全局、注册通用路由、提供 lifespan | 否（只认插件协议） |
+| 内核能力 | `agent_core/` | plugins 契约、认证、SSE、意图路由框架、执行面 Harness 策略 | 否 |
 | 领域插件 | `domains/<域>/` | 服务装配、图构建、领域专属路由 | 是（各领域自持） |
 
 **PluginRegistry 是唯一启用开关**：`domains/registry.py` 的 `default_registry()` 返回要启用的插件列表。
@@ -147,6 +148,8 @@ create_app(registry)
         required_slots 缺槽位 / needs_clarification 低置信 -> 内核 clarify 节点
    -> assistant 图按能力名动态建节点（节点集合 = 已注册能力名 + 三个内置落点）
         classify 追加 plan trace（所选能力 / 依据 / 澄清 / 确认），裁决并入已有 done trace
+   -> HarnessRegistry 按 domain 选择执行面策略（循环/上下文/工具/预算）
+        默认 Harness 不改变 SSE 事件序列；领域可只换 policy 或重写 stream_answer / run_graph
 ```
 
 `configs/domains.yaml` 已瘦身为只含 general 的回退清单；完整三域清单由
@@ -184,7 +187,7 @@ HTTP 路由（无模型，静态 URL 匹配）
 ```
 
 1. **HTTP 层路由**（FastAPI 装饰器）—— 纯 URL 匹配，请求打到哪个 endpoint 是写死的，**没有大模型**。
-   通用路由在 `app.py`，领域路由在 `domains/<域>/routes.py` 由各插件注册（见上一节）。
+   通用路由在 `app_factory.py`，领域路由在 `domains/<域>/routes.py` 由各插件注册（见上一节）。
 2. **意图路由层** —— 进入 `/api/assistant/stream` 后，`IntentRouter` 判定 `domain + intent + confidence`：
    - `shadow`（默认）：LLM 主路由，JEV 影子并行只记录；
    - `hybrid`：JEV 主路由，低置信或异常时 LLM 兜底；
@@ -292,7 +295,7 @@ START
 - **执行计划**：显示 `<intent> → <capability>`，并标注「先澄清 / 需确认 / 缺 <槽位>」；
 - 聊天消息上的意图徽章同时显示引擎，例如 `交易指令 · 100% · JEV`。
 
-**外层执行器**（`app.py` 的 `assistant_stream`）
+**外层执行器**（`app_factory.py` 的 `assistant_stream`）
 
 ```
 ainvoke 图 -> 重放 events（trace + intent + clarification_status + material_status + content）-> 流式 LLM 回答 -> done

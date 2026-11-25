@@ -1,0 +1,17 @@
+"""${description}领域路由：依赖全部从 AppContext 取，不 import app.py。"""
+from __future__ import annotations
+
+from typing import Any
+
+from fastapi import Depends
+
+from agent_core.plugins import AppContext
+from agent_core.security import authenticate
+
+
+def register_routes(ctx: AppContext) -> None:
+    application = ctx.application
+
+    @application.get('/api/$name/health', dependencies=[Depends(authenticate)], tags=['$name'])
+    async def ${name}_health() -> dict[str, Any]:
+        return {'status': 'ok', 'domain': '$name'}

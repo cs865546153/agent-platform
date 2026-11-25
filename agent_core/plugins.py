@@ -23,6 +23,7 @@ from typing import Any, Protocol, runtime_checkable
 from fastapi import FastAPI
 
 from agent_core.capabilities import AssistantCapabilities
+from agent_core.harness import Harness, HarnessRegistry
 
 
 @dataclass
@@ -48,6 +49,8 @@ class AppContext:
     # 领域插件注册的对话编排能力（能力名 → 对话图节点实现）。
     # 内核按领域清单声明的能力名分派，未注册的能力回落内置 answer / guard。
     capabilities: AssistantCapabilities = field(default_factory=AssistantCapabilities)
+    # 执行面策略：领域可覆盖循环/上下文/工具/预算；未注册时用默认 Harness。
+    harnesses: HarnessRegistry = field(default_factory=HarnessRegistry)
     intent_router: Any = None
     intent_registry: Any = None
     # 写操作确认闸门（内核确定性裁决，非 LLM 判断）；由 create_app 从领域清单聚合后注入，
@@ -57,6 +60,10 @@ class AppContext:
     @property
     def state(self) -> Any:
         return self.application.state
+
+    def harness_for(self, domain: str | None = None) -> Harness:
+        """取领域执行策略；未注册时返回默认策略。"""
+        return self.harnesses.get(domain)
 
     def lock_for(self, key: str) -> asyncio.Lock:
         """按业务主键取锁（进程内）；插件不应自行创建锁集合。"""

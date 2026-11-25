@@ -11,11 +11,11 @@
   `INTENT_ENGINE=hybrid`（JEV 主 + LLM 兜底）；
 - **部署**：Docker Compose + nginx `/ai/` 子路径，线上演示入口为 <https://aiwanxiang.top/ai/>（由 nginx Basic Auth 保护，凭据不写入仓库）。
 
-项目最初基于理赔 Agent 培训材料，现已扩展为可本地运行、可容器化部署的多领域 RAG 应用，并已按**企业级 Agent 模板**重构：内核（`app.py` / `agent_core/`）与业务领域（`domains/`）解耦，新增领域通过 `DomainPlugin` 插件注入、无需改内核；详见 [TEMPLATE.md](TEMPLATE.md)。真实理赔仍需接入组织内的保单查询、单证核验、通知/支付等适配器；未配置时状态机会显式转人工，不返回假保单或虚构定损。
+项目最初基于理赔 Agent 培训材料，现已扩展为可本地运行、可容器化部署的多领域 RAG 应用，并已按**企业级 Agent 模板**重构：内核（`app.py` / `agent_core/`）与业务领域（`domains/`）解耦，新增领域通过 `DomainPlugin` 插件注入、无需改内核；可用 `python -m scripts.create_domain <name>` 生成领域骨架。详见 [TEMPLATE.md](TEMPLATE.md)。真实理赔仍需接入组织内的保单查询、单证核验、通知/支付等适配器；未配置时状态机会显式转人工，不返回假保单或虚构定损。
 
 个人学习资料（`My_Study/`）与培训实现追踪清单已迁至工作区根目录 `../teaching-archive/`，不属于模板运行时；下文个别历史说明中的 `My_Study/Python/` 指该归档目录内的学习环境。
 
-**当前验证基线（2026-11-25 澄清闸门 + plan trace 后）**：`244 passed, 1 skipped`（领域/意图路由可插拔、能力分派、确认闸门、澄清闸门、`/ready` 图校验与内核边界门禁契约测试），覆盖率约 83%；跳过项为需要真实 Milvus 的集成测试。`bash scripts/start_mac.sh` 启动后 `/health`、`/ready`、首页与 19 个路由均正常。架构见 [Architecture.md](Architecture.md)，模板化说明见 [TEMPLATE.md](TEMPLATE.md)（培训实现追踪清单已归档至 `../teaching-archive/`），Agent 工作约定见 [AGENTS.md](AGENTS.md)。
+**当前验证基线（2026-11-25 执行面 harness 接入后）**：`258 passed, 1 skipped`（领域/意图路由可插拔、能力分派、确认闸门、澄清闸门、执行面 harness、create-domain 脚手架、薄应用入口、`/ready` 图校验与内核边界门禁契约测试），覆盖率约 83%；跳过项为需要真实 Milvus 的集成测试。`bash scripts/start_mac.sh` 启动后 `/health`、`/ready`、首页与 19 个路由均正常。架构见 [Architecture.md](Architecture.md)，模板化说明见 [TEMPLATE.md](TEMPLATE.md)（培训实现追踪清单已归档至 `../teaching-archive/`），Agent 工作约定见 [AGENTS.md](AGENTS.md)。
 
 主要链路：
 
@@ -80,6 +80,7 @@ lsof -ti tcp:8001 | xargs ps -o pid,ppid,command -p
 cd /Users/Song/workspace/claims-ai-agent
 bash scripts/set_deepseek_key.sh   # 首次：交互式写入 DeepSeek Key 并校验（不回显）
 bash scripts/start_mac.sh          # 启动；任意目录执行都可以，自动切根目录 + 选 venv
+bash scripts/start_mac.sh --app=apps.claims_app:app  # 只装理赔领域
 # 打开 http://127.0.0.1:8001/
 ```
 
@@ -232,6 +233,16 @@ uvicorn app:app --host 127.0.0.1 --port 8001 --reload \
 .venv-py315/bin/uvicorn app:app --host 127.0.0.1 --port 8001 --reload
 ```
 
+按助手裁剪（只装配需要的领域，未装配领域的路由不存在）：
+
+```bash
+.venv-py315/bin/uvicorn apps.claims_app:app --host 127.0.0.1 --port 8001
+.venv-py315/bin/uvicorn apps.investment_app:app --host 127.0.0.1 --port 8002
+.venv-py315/bin/uvicorn apps.unified_app:app --host 127.0.0.1 --port 8003
+```
+
+`app.py` 等价于 `apps.unified_app`；三者共享 `app_factory.py` 的通用装配。
+
 - 工作台：<http://127.0.0.1:8001/>
 - 接口文档：<http://127.0.0.1:8001/docs>
 - 检查点库：首次启动自动创建 `.data/checkpoints.sqlite`
@@ -304,7 +315,7 @@ docker compose up -d --build
 
 Apple Silicon 上应用容器为 arm64。若 `--profile infra` 的 Milvus 拉不到 arm64 镜像，可对这些服务单独使用 `--platform linux/amd64`，或只启动 `app` 并指向外部 Milvus。
 
-> 本机验证（macOS 14.8.2 / Apple Silicon / Python 3.15.1）：`pip check` 无冲突，`pytest` 为 **244 passed, 1 skipped**（跳过项需真实 Milvus），`uvicorn app:app` 启动后 `/health`、`health_check.py` 均通过。国内网络安装依赖时请使用上面的清华镜像。
+> 本机验证（macOS 14.8.2 / Apple Silicon / Python 3.15.1）：`pip check` 无冲突，`pytest` 为 **258 passed, 1 skipped**（跳过项需真实 Milvus），`uvicorn app:app` 启动后 `/health`、`health_check.py` 均通过。国内网络安装依赖时请使用上面的清华镜像。
 
 ## 结构与职责
 
@@ -441,7 +452,7 @@ agents/tools/prompts/models/tests及新增Python包均有`__init__.py`。
 | PyYAML | 6.0.3 | 6.0.3（纯 Python wheel） | 官方无 cp315 wheel，见 `vendor/` |
 | ruff | 0.9.10 | 不变 | 自带 `py3-none-win_amd64` wheel |
 
-> 验证结果：`pip check` 无依赖冲突；本轮测试集在 macOS 上为 **244 passed, 1 skipped**（跳过的是需要真实 Milvus 服务的集成用例），Windows 未在本轮复测。
+> 验证结果：`pip check` 无依赖冲突；本轮测试集在 macOS 上为 **258 passed, 1 skipped**（跳过的是需要真实 Milvus 服务的集成用例），Windows 未在本轮复测。
 
 Windows（PowerShell）：
 
@@ -750,7 +761,7 @@ curl -s http://127.0.0.1:8001/api/rag/answer \
 - 意图路由已接入 `/api/assistant/stream`：JEV / LLM / Hybrid / Shadow 可切换，代码默认 shadow，当前 `.env` 为 hybrid；
 - BGE-M3 + BGE-Reranker 已启用，正常检索返回 `rerank_fallback=false`；
 - 索引已建成：`investment_wiki` 约 55 个 chunk，`knowledge_general` 约 3 个 chunk；
-- `244 passed, 1 skipped`，覆盖率约 83%；审计哈希链、请求 ID、PII 脱敏和 RAG 诊断字段可用；
+- `258 passed, 1 skipped`，覆盖率约 83%；审计哈希链、请求 ID、PII 脱敏和 RAG 诊断字段可用；
 - 线上 `/ai/` 已通过 nginx Basic Auth 部署，`app` 容器只监听 `127.0.0.1:8001`。
 
 **仍需完善**
