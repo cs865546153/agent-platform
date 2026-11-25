@@ -17,6 +17,12 @@ intents:
     risk: medium
     mode: conversation
     capability: claim_workflow
+    # 发起案件属于写操作：对话链路做预审与材料门控，正式立案走独立 API
+    # 的状态机（checkpointer + HITL），避免在 SSE 会话里直接建案件。
+    confirmation:
+      api: /api/claims/process
+      requires_human_review: true
+      summary: 正式报案需提交案件要素并经业务接口核验，请通过理赔业务接口发起。
   - name: 材料审核
     description: 检查已上传单证的内容、完整性或真伪
     description_en: Review uploaded claim documents for content, completeness, or authenticity

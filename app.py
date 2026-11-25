@@ -129,6 +129,7 @@ def create_app(
     registry: PluginRegistry | None = None,
     intent_router: Any = None,
     intent_domain_registry: Any = None,
+    confirm_gate: Any = None,
 ) -> FastAPI:
     """装配应用。
 
@@ -138,6 +139,9 @@ def create_app(
     意图路由同样可插拔：``intent_router`` 显式传入时跳过内核构建（测试/自定义引擎）；
     否则 ``intent_domain_registry`` 决定领域清单，未传时从已启用插件的
     ``intent_manifest()`` 聚合（YAML 回退补齐无插件的领域，如 general）。
+
+    ``confirm_gate`` 是写操作确认闸门（确定性裁决，不调用 LLM）；不传时按领域清单
+    聚合出的契约自动构建。显式注入可替换裁决规则，便于测试与自定义风控。
 
     ``overrides`` / ``models`` 是领域依赖的注入点，键名由插件自己解释
     （如 ``overrides={'investment_rag': ...}``、``models={'investment_advice': ...}``）：
@@ -192,11 +196,20 @@ def create_app(
     # 对话图的分支策略 = 领域清单 + 能力注册表。两者都在 build_services 之后就位，
     # 因此新增领域只要声明意图并注册能力即可被路由，不必改内核。
     from agent_core.capabilities import missing_handlers
+    from agent_core.confirmation import ConfirmGate
     from agents.assistant_agent import IntentRoutingPolicy
 
     for capability, domain in missing_handlers(intent_domain_registry, ctx.capabilities):
         logger.warning('领域 %s 声明了对话能力 %s 但没有实现，将回落到内核内置能力', domain, capability)
-    routing_policy = IntentRoutingPolicy.from_registry(intent_domain_registry, ctx.capabilities)
+    # 写操作确认闸门：LLM 只提议意图，"是否需要确认 / 去哪个独立 API"由内核按领域
+    # 清单的 confirmation 契约确定性裁决。显式注入优先，否则按聚合清单构建。
+    effective_confirm_gate = confirm_gate or ConfirmGate.from_registry(intent_domain_registry)
+    ctx.confirm_gate = effective_confirm_gate
+    for issue in effective_confirm_gate.audit_capabilities():
+        logger.warning('确认闸门装配检查：%s', issue)
+    routing_policy = IntentRoutingPolicy.from_registry(
+        intent_domain_registry, ctx.capabilities, confirm_gate=effective_confirm_gate,
+    )
     if intent_router is None:
         # 领域插件在 build_services 注册的槽位抽取器交给适配层；内核不认识具体槽位名。
         slot_extractor = composite_slot_extractor(ctx.slot_extractors)
@@ -231,6 +244,7 @@ def create_app(
         application.state.intent_router = effective_intent_router
         application.state.intent_registry = intent_domain_registry
         application.state.capabilities = ctx.capabilities
+        application.state.confirm_gate = effective_confirm_gate
         # 图内分支策略从领域清单与能力注册表派生；未声明领域时只剩内核内置能力。
         application.state.intent_routing_policy = routing_policy
         try:
@@ -469,6 +483,16 @@ def create_app(
             media_type='text/event-stream',
             headers=stream_headers(),
         )
+
+    # 装配自检：写操作契约指向的独立 API 必须真实注册，否则 guard 会给用户一条死引导。
+    # 领域插件可增删，这一步在全部路由注册完成后执行，避免只配清单忘了实现接口。
+    registered_paths = {getattr(route, 'path', '') for route in application.routes}
+    for issue in effective_confirm_gate.audit_routes(registered_paths):
+        logger.warning('确认闸门装配检查：%s', issue)
+    application.state.confirmation_audit = (
+        effective_confirm_gate.audit_capabilities()
+        + effective_confirm_gate.audit_routes(registered_paths)
+    )
 
     return application
 

@@ -46,3 +46,9 @@ intents:
     risk: high
     mode: case
     capability: trade_gate
+    # 写操作契约：对话链路只拦截引导，真正执行走独立 API 的二次确认 + 人工审批。
+    # ConfirmGate 据此做确定性裁决，不依赖模型判断"要不要确认"。
+    confirmation:
+      api: /api/investment/process
+      requires_human_review: true
+      summary: 交易指令需经适当性校验、二次确认与授权人员审批，请通过投资业务接口提交。

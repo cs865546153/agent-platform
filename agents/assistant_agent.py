@@ -30,6 +30,7 @@ from agent_core.capabilities import (
     capability_of,
     domain_of_intent,
 )
+from agent_core.confirmation import ConfirmGate
 from agents.middleware_audit import mask_pii
 
 LOGGER = logging.getLogger(__name__)
@@ -92,6 +93,8 @@ class AssistantState(TypedDict, total=False):
     capability: str
     stage: str
     route_evidence: dict[str, Any]
+    # 写操作确认裁决（内核确定性产出，领域处理器与 guard 据此引导）
+    confirmation: dict[str, Any]
     # 回答（由能力处理器装配，外层执行器负责流式）
     llm: Any
     messages: list[Any]
@@ -108,6 +111,8 @@ class RouteTarget:
     capability: str
     handler: AssistantHandler | None
     evidence: dict[str, Any] = field(default_factory=dict)
+    # 写操作确认裁决（内核确定性产出）；非写操作为空 dict。
+    confirmation: dict[str, Any] = field(default_factory=dict)
 
 
 class IntentRoutingPolicy:
@@ -115,18 +120,24 @@ class IntentRoutingPolicy:
 
     模板化的关键：这里不再有按领域硬编码的意图集合，落点只可能是"能力名"，
     新增领域只要在自己的清单里声明意图与能力，就能被路由到对应节点。
+
+    ``confirm_gate`` 是写操作确认闸门：LLM 只提议意图，是否需确认、去哪个
+    独立 API 由它确定性裁决；写操作意图绝不落到自由问答（``answer``）。
     """
 
     def __init__(self, registry: Any = None,
-                 capabilities: AssistantCapabilities | None = None) -> None:
+                 capabilities: AssistantCapabilities | None = None,
+                 confirm_gate: ConfirmGate | None = None) -> None:
         self.registry = registry
         self.capabilities = capabilities or AssistantCapabilities()
+        self.confirm_gate = confirm_gate or ConfirmGate.from_registry(registry)
 
     @classmethod
     def from_registry(cls, registry: Any,
-                      capabilities: AssistantCapabilities | None = None) -> "IntentRoutingPolicy":
+                      capabilities: AssistantCapabilities | None = None,
+                      confirm_gate: ConfirmGate | None = None) -> "IntentRoutingPolicy":
         """从 ``DomainRegistry`` 派生策略；``None`` 表示只用内核内置能力。"""
-        return cls(registry, capabilities)
+        return cls(registry, capabilities, confirm_gate)
 
     def domain_for(self, intent: str | None, *, fallback: str | None = None) -> str:
         """意图归属的领域；清单反查不到时用路由结果里的领域名，再退到 general。"""
@@ -134,13 +145,25 @@ class IntentRoutingPolicy:
 
     def resolve(self, domain: str | None, intent: str | None,
                 state: dict[str, Any]) -> RouteTarget:
-        """先问领域改写钩子，再按清单解析能力与处理器。"""
+        """先问领域改写钩子，再按清单解析能力与处理器，最后过确认闸门。
+
+        闸门只做两件事：产出结构化裁决、禁止写操作落到自由问答。它不改派
+        已声明的领域能力，因此既有 SSE 事件序列保持不变。
+        """
         redirect = self.capabilities.redirect(state)
         if redirect is not None:
-            return RouteTarget(redirect.domain, redirect.capability,
+            base = RouteTarget(redirect.domain, redirect.capability,
                                self.capabilities.get(redirect.capability), dict(redirect.evidence))
-        capability, handler = self.capabilities.dispatch(self.registry, domain, intent)
-        return RouteTarget(domain or 'general', capability, handler)
+        else:
+            capability, handler = self.capabilities.dispatch(self.registry, domain, intent)
+            base = RouteTarget(domain or 'general', capability, handler)
+
+        decision = self.confirm_gate.decide(base.domain, intent)
+        enforced = self.confirm_gate.enforce(base.capability, decision)
+        handler = (self.capabilities.get(enforced) if enforced != base.capability
+                   else base.handler)
+        return RouteTarget(base.domain, enforced, handler, base.evidence,
+                           decision.as_dict() if decision.required else {})
 
 
 def chat_content(value: Any) -> str:
@@ -343,7 +366,8 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
                                             'declared': declared}}})
         return {'intent': intent.intent, 'confidence': intent.confidence, 'slots': slots,
                 'domain': target.domain, 'capability': target.capability, 'stage': target.domain,
-                'route_evidence': target.evidence, 'events': events}
+                'route_evidence': target.evidence, 'confirmation': target.confirmation,
+                'events': events}
 
     async def answer(state: dict[str, Any]) -> dict[str, Any]:
         """内核兜底：通用模型直接回答，不需要任何领域参与。"""
@@ -357,8 +381,18 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
         }
 
     async def guard(state: dict[str, Any]) -> dict[str, Any]:
-        """内核兜底：高风险 / 案件型意图没有领域处理器时，只能拦截，不能放行。"""
+        """内核统一拦截：写操作没有领域处理器时只引导到独立 API，不执行动作。
+
+        引导信息来自 ``ConfirmGate`` 的结构化裁决（领域清单声明），内核不写死
+        业务接口路径；裁决缺失时退回中性话术，保持"清单缺失不致命"的兜底。
+        """
         node = state.get('stage') or GUARD_CAPABILITY
+        decision = state.get('confirmation') or {}
+        message = guard_message
+        if decision.get('api'):
+            message += f"请通过 {decision['api']} 提交，由业务接口完成校验、二次确认与人工审批。"
+        elif decision.get('summary'):
+            message += decision['summary']
         return {
             'events': [
                 {'trace': {'node': node, 'status': 'running',
@@ -366,8 +400,9 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
                            'input': {'intent': state['intent'], 'capability': state.get('capability')}}},
                 {'trace': {'node': node, 'status': 'done',
                            'output': {'executed': False, 'requires_confirmation': True,
-                                      'requires_human_review': True}}},
-                {'content': guard_message},
+                                      'requires_human_review': True,
+                                      'confirmation': decision or {'source': 'none'}}}},
+                {'content': message},
             ],
             'needs_llm_answer': False,
         }
@@ -375,7 +410,11 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
     # 补齐内置能力后的注册表同时供分派与建节点使用：改写钩子、清单落点和图节点
     # 因此看到同一份能力表。内置能力不覆盖领域已注册的同名实现。
     available = capabilities.with_kernel(answer=answer, guard=guard)
-    policy = IntentRoutingPolicy(registry, available)
+    # 保留装配期注入的确认闸门：显式构造的 ConfirmGate 不能被默认派生覆盖，
+    # 否则 create_app 传入的自定义裁决规则会静默失效。
+    policy = IntentRoutingPolicy.from_registry(
+        registry, available, confirm_gate=base.confirm_gate,
+    )
     node_names = available.names()
 
     def route_after_classify(state: AssistantState) -> str:
@@ -398,10 +437,15 @@ def build_assistant_graph(*, classifier: Any, general_model: Any,
 
 
 def _capability_node(capability: str, handler: AssistantHandler) -> Any:
-    """把能力包成图节点：领域编排失败不能整条 SSE 中断，显式降级为转人工提示。"""
+    """把能力包成图节点：领域编排失败不能整条 SSE 中断，显式降级为转人工提示。
+
+    写操作确认裁决在这里由内核并入**已有**的 done trace（只加字段、不新增事件），
+    因此所有领域处理器自动带上结构化引导，不必感知闸门、也不改变 SSE 事件序列；
+    新增领域只要声明 confirmation 契约即可生效，内核零改动。
+    """
     async def node(state: AssistantState) -> dict[str, Any]:
         try:
-            return await handler(dict(state))
+            result = await handler(dict(state))
         except Exception as exc:  # noqa: BLE001 - 领域故障降级为人工处理，不吞成空回答
             LOGGER.exception('对话能力执行失败：%s', capability)
             return {
@@ -413,6 +457,15 @@ def _capability_node(capability: str, handler: AssistantHandler) -> Any:
                     {'content': '业务处理暂时不可用，请稍后重试或转人工。'},
                 ],
             }
+        decision = state.get('confirmation')
+        if isinstance(decision, dict) and decision.get('required'):
+            for event in result.get('events', []):
+                trace = event.get('trace')
+                if isinstance(trace, dict) and trace.get('status') == 'done':
+                    output = trace.setdefault('output', {})
+                    if isinstance(output, dict):
+                        output.setdefault('confirmation', decision)
+        return result
 
     return node
 

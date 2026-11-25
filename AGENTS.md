@@ -69,6 +69,7 @@ adapters/               真实业务适配器（HTTP + 熔断 + 降级）与 dem
 agent_core/             领域无关内核
   plugins.py            DomainPlugin 协议、AppContext、PluginRegistry（模板扩展点）
   capabilities.py       对话编排能力注册表：按能力名分派，内置 answer / guard
+  confirmation.py       写操作确认闸门：按清单确定性裁决，写操作绝不落到自由问答
   security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容）、生产密钥校验
   sse.py                SSE 帧编码（app.py 已接入）
   intent/               意图路由公共层：JEV / LLM / Hybrid / Registry / adapter
@@ -280,6 +281,12 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
 - `agent_core/capabilities.py`：`AssistantCapabilities` 注册表（能力名全局唯一，
   即对话图节点名）、`Redirect` 意图改写钩子、`with_kernel()` 补内置 `answer`/`guard`、
   `missing_handlers()` 供装配期自检（`app.py` 会打 warning）。
+- `agent_core/confirmation.py`：`ConfirmGate` 写操作确认闸门。从聚合清单读取
+  `IntentSpec.confirmation`，对声明契约或 `risk=high`/`mode=case` 的意图确定性裁决
+  "需确认"，`enforce()` 把误落 `answer` 的写操作改派 `guard`；`audit_capabilities()` /
+  `audit_routes()` 供装配自检（落点错误 / `api` 死链）。裁决并入对话图已有 done trace，
+  只加字段不新增事件。**新增写操作意图必须在插件 manifest 声明 `confirmation`**，
+  内核不写死业务路径。契约由 `tests/test_confirmation_gate.py` 守护。
 - `settings.py` / `.env.example`：`INTENT_ROUTER_ENABLED`、`INTENT_*`、`JEV_*`，
   重试相关为 `JEV_MAX_RETRIES`（默认 2）和 `JEV_RETRY_BACKOFF_S`（默认 0.25）。
 - 测试：`tests/test_intent_jev.py`、`tests/test_intent_hybrid.py`、
@@ -470,6 +477,7 @@ returned=4
   tests/test_intent_registry.py \
   tests/test_intent_router_integration.py \
   tests/test_capabilities.py \
+  tests/test_confirmation_gate.py \
   tests/test_template_boundary.py \
   tests/test_logging_setup.py
 
@@ -480,12 +488,14 @@ returned=4
 bash scripts/verify.sh
 ```
 
-当前基线（2026-11-25 对话编排可插拔化后实跑）：
+当前基线（2026-11-25 写操作确认闸门后实跑）：
 
-- 全量测试：`222 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派与
-  内核边界门禁、P0 认证一致性回归；跳过项为需真实 Milvus 的集成测试）。
+- 全量测试：`233 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派、
+  写操作确认闸门 11 条契约、内核边界门禁、P0 认证一致性回归；
+  跳过项为需真实 Milvus 的集成测试）。
 - 模板相关契约：`tests/test_domain_plugin_template.py`、
   `tests/test_intent_plugin_template.py`、`tests/test_capabilities.py`、
+  `tests/test_confirmation_gate.py`、
   `tests/test_template_boundary.py`（改内核路由前必须先跑）。
 - 跳过项：`tests/test_milvus_integration.py`，需要真实 Milvus。
 - 已知无害日志：测试结束时 `milvus_lite` 可能打印

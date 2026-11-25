@@ -15,7 +15,7 @@
 
 个人学习资料（`My_Study/`）与培训实现追踪清单已迁至工作区根目录 `../teaching-archive/`，不属于模板运行时；下文个别历史说明中的 `My_Study/Python/` 指该归档目录内的学习环境。
 
-**当前验证基线（2026-11-25 对话编排可插拔化后）**：`222 passed, 1 skipped`（领域可插拔 + 意图路由可插拔 + 能力分派 + 内核边界门禁契约测试），覆盖率约 83%；跳过项为需要真实 Milvus 的集成测试。`bash scripts/start_mac.sh` 启动后 `/health`、`/ready`、首页与 19 个路由均正常。架构见 [Architecture.md](Architecture.md)，模板化说明见 [TEMPLATE.md](TEMPLATE.md)（培训实现追踪清单已归档至 `../teaching-archive/`），Agent 工作约定见 [AGENTS.md](AGENTS.md)。
+**当前验证基线（2026-11-25 写操作确认闸门后）**：`233 passed, 1 skipped`（领域可插拔 + 意图路由可插拔 + 能力分派 + 写操作确认闸门 + 内核边界门禁契约测试），覆盖率约 83%；跳过项为需要真实 Milvus 的集成测试。`bash scripts/start_mac.sh` 启动后 `/health`、`/ready`、首页与 19 个路由均正常。架构见 [Architecture.md](Architecture.md)，模板化说明见 [TEMPLATE.md](TEMPLATE.md)（培训实现追踪清单已归档至 `../teaching-archive/`），Agent 工作约定见 [AGENTS.md](AGENTS.md)。
 
 主要链路：
 
@@ -304,7 +304,7 @@ docker compose up -d --build
 
 Apple Silicon 上应用容器为 arm64。若 `--profile infra` 的 Milvus 拉不到 arm64 镜像，可对这些服务单独使用 `--platform linux/amd64`，或只启动 `app` 并指向外部 Milvus。
 
-> 本机验证（macOS 14.8.2 / Apple Silicon / Python 3.15.1）：`pip check` 无冲突，`pytest` 为 **222 passed, 1 skipped**（跳过项需真实 Milvus），`uvicorn app:app` 启动后 `/health`、`health_check.py` 均通过。国内网络安装依赖时请使用上面的清华镜像。
+> 本机验证（macOS 14.8.2 / Apple Silicon / Python 3.15.1）：`pip check` 无冲突，`pytest` 为 **233 passed, 1 skipped**（跳过项需真实 Milvus），`uvicorn app:app` 启动后 `/health`、`health_check.py` 均通过。国内网络安装依赖时请使用上面的清华镜像。
 
 ## 结构与职责
 
@@ -389,6 +389,15 @@ agents/tools/prompts/models/tests及新增Python包均有`__init__.py`。
   `create_app(intent_router=...)` 显式注入自定义 router；代码默认 `shadow`，
   当前 `.env` 为 `hybrid`：JEV 主路由 + LLM 兜底；路由异常时回落 `assistant_agent`
   内置分类模型，SSE 不中断
+- **写操作确认闸门**：`ConfirmGate`（`agent_core/confirmation.py`）从领域清单的
+  `IntentSpec.confirmation`（`api` / `requires_human_review` / `summary`）做确定性裁决，
+  声明了契约或 `risk=high` / `mode=case` 的意图一律判"需确认"，绝不落到 `answer`
+  （误落时强制改派 `guard`）；目标独立 API、是否需人工审批、裁决来源并入对话图已有的
+  done trace（只加字段、不新增事件，SSE 序列不变）。裁决是纯确定性代码、不调用 LLM，
+  领域 handler 无需感知，新增领域自动生效。装配期自检契约落到自由问答、`api` 指向
+  未注册路由并打 warning（`application.state.confirmation_audit`）。对话链路无状态、
+  无 checkpointer、无 HITL，永不执行写操作；真正执行仍走独立 API 的校验/二次确认/人工审批。
+  契约由 `tests/test_confirmation_gate.py` 守护
 - 图负责编排决策，LLM 流式回答由外层执行器（`app.py` 的 `assistant_stream`）负责
 - 无 checkpointer，每次请求新建图，状态仍由前端回传（history / material_round）
 - 详细结构见 [Architecture.md](Architecture.md)，意图路由细节见
@@ -424,7 +433,7 @@ agents/tools/prompts/models/tests及新增Python包均有`__init__.py`。
 | PyYAML | 6.0.3 | 6.0.3（纯 Python wheel） | 官方无 cp315 wheel，见 `vendor/` |
 | ruff | 0.9.10 | 不变 | 自带 `py3-none-win_amd64` wheel |
 
-> 验证结果：`pip check` 无依赖冲突；本轮测试集在 macOS 上为 **222 passed, 1 skipped**（跳过的是需要真实 Milvus 服务的集成用例），Windows 未在本轮复测。
+> 验证结果：`pip check` 无依赖冲突；本轮测试集在 macOS 上为 **233 passed, 1 skipped**（跳过的是需要真实 Milvus 服务的集成用例），Windows 未在本轮复测。
 
 Windows（PowerShell）：
 
@@ -733,7 +742,7 @@ curl -s http://127.0.0.1:8001/api/rag/answer \
 - 意图路由已接入 `/api/assistant/stream`：JEV / LLM / Hybrid / Shadow 可切换，代码默认 shadow，当前 `.env` 为 hybrid；
 - BGE-M3 + BGE-Reranker 已启用，正常检索返回 `rerank_fallback=false`；
 - 索引已建成：`investment_wiki` 约 55 个 chunk，`knowledge_general` 约 3 个 chunk；
-- `222 passed, 1 skipped`，覆盖率约 83%；审计哈希链、请求 ID、PII 脱敏和 RAG 诊断字段可用；
+- `233 passed, 1 skipped`，覆盖率约 83%；审计哈希链、请求 ID、PII 脱敏和 RAG 诊断字段可用；
 - 线上 `/ai/` 已通过 nginx Basic Auth 部署，`app` 容器只监听 `127.0.0.1:8001`。
 
 **仍需完善**

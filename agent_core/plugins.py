@@ -50,6 +50,9 @@ class AppContext:
     capabilities: AssistantCapabilities = field(default_factory=AssistantCapabilities)
     intent_router: Any = None
     intent_registry: Any = None
+    # 写操作确认闸门（内核确定性裁决，非 LLM 判断）；由 create_app 从领域清单聚合后注入，
+    # 插件只读，不负责构建。领域插件如需声明写操作意图，在 manifest 里写 confirmation 契约。
+    confirm_gate: Any = None
 
     @property
     def state(self) -> Any:

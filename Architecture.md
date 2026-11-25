@@ -41,6 +41,7 @@
 【内核能力层】 agent_core/ —— 领域无关
   plugins.py  : DomainPlugin 协议、AppContext、PluginRegistry
   capabilities.py : 对话编排能力表（内核只内置 answer / guard，其余由领域注册）
+  confirmation.py : 写操作确认闸门（按清单确定性裁决，写操作绝不落自由问答）
   security.py : 统一认证与生产密钥校验；sse.py : SSE 帧编码（app.py 已接入）
   intent/     : JEV / LLM / Hybrid / Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
        |
@@ -135,15 +136,28 @@ create_app(registry)
   -> build_assistant_intent_router(cfg, intent_model, domain_registry, slot_extractor)
        显式 intent_router 注入时跳过构建，内核不接管其生命周期
        slot_extractor 来自 AppContext.slot_extractors（领域插件注册的业务槽位规则）
-  -> IntentRoutingPolicy.from_registry(intent_domain_registry, ctx.capabilities)
+  -> IntentRoutingPolicy.from_registry(intent_domain_registry, ctx.capabilities, confirm_gate)
        意图 -> IntentSpec.capability（能力名）+ 领域处理器；内核只内置 answer / guard
+  -> ConfirmGate.from_registry(...)（确定性裁决，不调用 LLM）
+       声明 confirmation / risk=high / mode=case 一律判"需确认"；
+       误落 answer 时强制改派 guard，其余领域能力原样保留
   -> assistant 图按能力名动态建节点（节点集合 = 已注册能力名 + 两个内置落点）
+       裁决并入已有 done trace（只加字段、不新增事件），SSE 序列不变
 ```
 
 `configs/domains.yaml` 已瘦身为只含 general 的回退清单；完整三域清单由
 `domains.registry.default_domain_registry()` 从插件聚合。新增领域只需在插件目录写
 `manifest.yaml`，无需改全局 YAML，也无需在 `agent_core` 里写业务字段。
-契约由 `tests/test_intent_plugin_template.py` 守护。
+契约由 `tests/test_intent_plugin_template.py` 守护；写操作确认闸门由
+`tests/test_confirmation_gate.py` 守护（含装配自检：契约落到自由问答、
+或 `api` 指向未注册路由都会告警）。
+
+**写操作确认闸门**：对话链路（SSE）无状态、无 checkpointer、无 HITL，
+改变业务状态的动作绝不在这里执行。`ConfirmGate` 从聚合清单读取
+`IntentSpec.confirmation`（`api` / `requires_human_review` / `summary`），
+由确定性代码裁决"是否需要确认 / 去哪个独立 API / 是否需人工审批"，
+LLM 只提议意图。`guard` 与该领域能力据此输出结构化引导，真正执行仍走独立 API
+（checkpointer + HITL 中断恢复 + 审核员二次认证）。新增领域只要声明契约即自动生效。
 
 **领域无关的横切能力**（对全部领域一律生效，插件无需重复实现）：审计哈希链
 （`agents/audit_store.py`）、接入限流与 500 兜底（`agents/http_middleware.py`）、

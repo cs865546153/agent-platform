@@ -17,6 +17,7 @@ app.py                     内核：FastAPI 装配 + 通用路由（health/ready
 agent_core/                领域无关内核
   ├─ plugins.py            DomainPlugin 协议（intent_manifest）、AppContext（slot_extractors/capabilities）、PluginRegistry
   ├─ capabilities.py       对话编排能力注册表：内核按"能力名"分派，只内置 answer / guard
+  ├─ confirmation.py       写操作确认闸门：按清单确定性裁决，写操作绝不落到自由问答
   ├─ security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容旧部署）
   ├─ sse.py                SSE 帧编码（已接入 app.py，无内联副本）
   └─ intent/               JEV/LLM/Hybrid/Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
@@ -45,6 +46,7 @@ configs/domains.yaml       运行时回退清单：只保留无插件领域（ge
 | 模型工厂 / 任务档位 / 缓存 / 降级 | `config.py`（`LLMFactory`、`register_task_profile()`）、`agents/middleware_audit.py` | 否；领域可注册自己的档位 |
 | 领域槽位兜底抽取 | `AppContext.slot_extractors`，由插件在 `build_services` 注册 | 内核不内置业务字段形态 |
 | 对话编排能力分派 | `agent_core/capabilities.py` + `agents/assistant_agent.py` 动态建图 | 在 `build_services` 里 `ctx.capabilities.register(名字, handler)` |
+| 写操作确认闸门 | `agent_core/confirmation.py`（`ConfirmGate` 确定性裁决） | 写操作意图在 manifest 声明 `confirmation`（指向独立 API）；内核自动拦截并引导，不执行动作 |
 | 多路召回 + RRF + BGE-Rerank + 引用校验 | `tools/knowledge_rag.py`、`tools/rerank.py` | 可选复用 |
 | HITL（中断 + 恢复 + 人工审批） | LangGraph `interrupt` + `domains/base.py:gate_resume/resume_gate` | 图内声明中断，恢复门控用基类 |
 | SSE 流式回答 | `app.py` assistant 路由 + `agent_core/sse.py` | 否 |
@@ -120,6 +122,13 @@ intents:
     risk: high
     mode: case
     capability: my_domain_submit
+    # 写操作契约：对话链路只拦截引导，真正执行交给独立 API 的校验/二次确认/人工审批。
+    # ConfirmGate 据此做确定性裁决（不问模型"要不要确认"）；省略时 high/case 也会被拦截，
+    # 但引导信息里没有目标接口。api 指向的路由必须真实注册，装配自检会校验死链。
+    confirmation:
+      api: /api/my_domain/submit
+      requires_human_review: true
+      summary: 请通过业务接口提交，由系统完成校验与授权审批。
 ```
 
 内核启动时从已启用插件的 `intent_manifest()` 聚合领域清单；
@@ -131,6 +140,14 @@ intents:
 `capability` 是对话图里的节点名。省略时按 `mode` / `risk` 推导：
 `case` 或 `high` → `guard`（拦截并说明需要确认），其余 → `answer`（通用模型直接回答）。
 宁可回落到内置落点，也不会让未实现的分支静默变成自由问答。
+
+**写操作必须声明 `confirmation`。** 内核的 `ConfirmGate` 从聚合清单读取契约，
+对声明了 `confirmation`、或 `risk=high` / `mode=case` 的意图一律裁决为"需要确认"：
+绝不允许落到 `answer`（误落时强制改派 `guard`），并把目标独立 API、是否需人工审批、
+裁决来源并入对话图已有的 done trace（只加字段、不新增事件，SSE 序列不变）。
+裁决是纯确定性代码、不调用 LLM；领域 handler 无需感知闸门，新增领域自动生效。
+装配期还会自检：契约落到自由问答、或 `api` 指向未注册路由，都会打 warning
+（`application.state.confirmation_audit` 可查）。契约由 `tests/test_confirmation_gate.py` 守护。
 
 ### 步骤 3：注册对话能力（让新领域在 `/api/assistant/stream` 可达）
 
@@ -178,6 +195,7 @@ def default_registry() -> PluginRegistry:
 pytest -q tests/test_domain_plugin_template.py   # 领域可插拔契约
 pytest -q tests/test_intent_plugin_template.py   # 意图路由可插拔契约
 pytest -q tests/test_capabilities.py             # 能力分派与动态建图契约
+pytest -q tests/test_confirmation_gate.py        # 写操作确认闸门契约
 pytest -q tests/test_template_boundary.py        # 内核边界门禁（源码扫描）
 pytest -q                                        # 全量
 ```
@@ -203,6 +221,9 @@ pytest -q                                        # 全量
 - **HITL 恢复跨进程可用**：LangGraph 重启后不再重建中断载荷，快照只剩待执行节点，
   因此恢复门控与响应阶段都用 `domains/base.py` 的 `gate_resume` / `resume_gate`
   按 `(状态, 待执行节点)` 重建；领域新增中断点时要一并给出 `node` 判据。
+- **确认闸门不是完整审批流**：`ConfirmGate` 在对话链路里做确定性拦截与结构化引导，
+  不承担二次确认状态机与人工审批存储；真正执行写操作仍走独立 API（checkpointer +
+  HITL 中断/恢复 + 审核员二次认证）。对话链路无状态、无检查点，永不落业务写入。
 - **教学产物已迁出**：`My_Study/`、培训追踪清单在 `../teaching-archive/`，不在模板运行时内。
 - **真实联调未完成**：本地 LLM、Milvus、Redis、LangFuse、核心业务系统需按部署环境接入；
   模板不虚构准确率、延迟或成本。详见 `docs/` 各专题与 `deploy/runbook.md`。
@@ -215,11 +236,13 @@ pytest -q                                        # 全量
 
 ## 5. 验证基线（2026-11-25）
 
-- `222 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；新增能力分派、
-  内核边界门禁与投资 HITL 重启恢复回归
+- `233 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；新增写操作确认闸门
+  11 条契约测试（契约形状、确定性裁决、强制不落自由问答、结构化引导、装配自检、
+  注入不丢失、SSE 事件序列不变）
 - Ruff 全项目通过；本次改动涉及的文件 Mypy 零错误（剩余告警均在未改动的既有模块）
 - 可插拔契约由 `tests/test_domain_plugin_template.py`、`tests/test_intent_plugin_template.py`、
-  `tests/test_capabilities.py`、`tests/test_template_boundary.py` 守护
+  `tests/test_capabilities.py`、`tests/test_confirmation_gate.py`、
+  `tests/test_template_boundary.py` 守护
 - 真实装配冒烟：`/health`、`/ready`、`/openapi.json` 均 200，19 条路由全部注册
   （含迁移后的 `/api/demo/claims/*`）；`POST /api/demo/claims/process` 走完整状态机；
   默认插件集注册 `claim_workflow / claims_answer / investment_answer / policy_query / trade_gate`

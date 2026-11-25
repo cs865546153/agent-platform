@@ -27,6 +27,25 @@ def fallback_capability(mode: str, risk: str) -> str:
     return "answer"
 
 
+class ConfirmationSpec(BaseModel):
+    """写操作意图的确认契约：对话链路只引导，真正执行交给独立 API。
+
+    领域在 manifest 里声明，内核据此做确定性裁决，不调用 LLM 判断"要不要确认"：
+
+    - ``api``：承载该写操作的确定性 HTTP 入口（相对路径，如 ``/api/claims/process``）；
+    - ``requires_human_review``：是否需要授权人员二次审批；
+    - ``summary``：给用户看的引导话术；留空时用内核的中性兜底文案。
+
+    字段名/值都属于领域事实源，内核只读取形状，不内置任何业务路径。
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    api: str = Field(min_length=1, max_length=200)
+    requires_human_review: bool = True
+    summary: str | None = Field(default=None, max_length=500)
+
+
 class IntentSpec(BaseModel):
     """领域内的一个意图及其路由元数据。"""
 
@@ -42,6 +61,9 @@ class IntentSpec(BaseModel):
     # 命中该意图时调用的编排能力名，由领域插件在装配期注册实现。
     # 留空时回落到内核内置能力（见 ``fallback_capability``）。
     capability: str | None = Field(default=None, pattern=CAPABILITY_PATTERN, max_length=64)
+    # 声明该意图会改变业务状态。内核的 ConfirmGate 据此拦截并引导到独立 API，
+    # 即使领域已注册对话能力也不会在 SSE 链路里直接执行写操作。
+    confirmation: ConfirmationSpec | None = None
 
     def criteria_text(self) -> str:
         """返回给意图引擎的意图描述，优先英文。"""
