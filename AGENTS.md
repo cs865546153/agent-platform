@@ -87,6 +87,7 @@ agent_core/             领域无关内核
   sse.py                SSE 帧编码（app.py 已接入）
   intent/               意图路由公共层：JEV / LLM / Hybrid / Registry / adapter
   harness/              执行面策略：Harness + 循环/上下文/工具/预算 + 按领域注册表
+  flow/                 业务控制层：plan/assemble/execute/observe/decide + 版本/确认/轨迹
 domains/                领域插件（可增删，新增领域不改内核）
   registry.py           默认领域登记表（唯一"启用哪些领域"的事实源）
   base.py               插件基类 + LangGraph 中断/配置/HITL 恢复门控共用辅助
@@ -335,6 +336,16 @@ intake → policy（保单/证据核验）→ experts（Send 并行三专家）�
   或插件在 `build_services` 写 `ctx.harnesses`；对话处理器可从 `state['harnesses']` 取。
   领域只换一个维度时改 policy，要接管整套循环则继承 `Harness` 重写 `stream_answer` /
   `run_graph`。默认策略不改变现有 SSE 事件序列；契约由 `tests/test_harness.py` 守护。
+- `agent_core/flow/`：业务控制层。`FlowEngine` 提供有界
+  `plan → assemble → execute → observe → decide` 循环，`FlowNodes` 由领域实现；
+  `VersionedFacts` 管事实版本/失效，`PendingAction` + `ConfirmExecutor` 管版本/TTL/载荷/幂等，
+  `ContextAssembler` 装配常驻事实，`FlowTrace` 记决策依据。默认 `max_steps=20`、
+  连续 2 轮无进展转人工。需要 LangGraph checkpoint / HITL 时用
+  `build_flow_graph(nodes, checkpointer=saver)` 把 `FlowNodes` 拆成
+  `plan / assemble / execute / observe / decide` 子图；确认拆成
+  `request_confirm` + `wait_confirm`，确保待确认动作先入 checkpoint 再 `interrupt`。
+  **flow 决定业务下一步，harness 决定执行资源**；
+  契约由 `tests/test_flow.py`、`tests/test_flow_langgraph.py` 守护。
 - `settings.py` / `.env.example`：`INTENT_ROUTER_ENABLED`、`INTENT_*`、`JEV_*`，
   重试相关为 `JEV_MAX_RETRIES`（默认 2）和 `JEV_RETRY_BACKOFF_S`（默认 0.25）。
 - 测试：`tests/test_intent_jev.py`、`tests/test_intent_hybrid.py`、
@@ -534,6 +545,8 @@ returned=4
   tests/test_confirmation_gate.py \
   tests/test_clarify_gate.py \
   tests/test_harness.py \
+  tests/test_flow.py \
+  tests/test_flow_langgraph.py \
   tests/test_create_domain.py \
   tests/test_app_shells.py \
   tests/test_template_boundary.py \
@@ -546,16 +559,18 @@ returned=4
 bash scripts/verify.sh
 ```
 
-当前基线（2026-11-25 执行面 harness 接入后实跑）：
+当前基线（2026-11-25 执行面 harness + 业务控制层接入后实跑）：
 
-- 全量测试：`258 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派、
+- 全量测试：`275 passed, 1 skipped`（含领域可插拔、意图路由可插拔、能力分派、
   写操作确认闸门 11 条契约、澄清闸门 9 条契约、执行面 harness 7 条契约、
-  create-domain 脚手架 4 条契约、薄应用入口 3 条契约、`/ready` 图声明校验、内核边界门禁、
-  P0 认证一致性回归；跳过项为需真实 Milvus 的集成测试）。
+  业务控制层 17 条契约（含 LangGraph 子图 5 条）、create-domain 脚手架 4 条契约、
+  薄应用入口 3 条契约、`/ready` 图声明校验、内核边界门禁、P0 认证一致性回归；
+  跳过项为需真实 Milvus 的集成测试）。
 - 模板相关契约：`tests/test_domain_plugin_template.py`、
   `tests/test_intent_plugin_template.py`、`tests/test_capabilities.py`、
   `tests/test_confirmation_gate.py`、`tests/test_clarify_gate.py`、
-  `tests/test_harness.py`、`tests/test_create_domain.py`、`tests/test_app_shells.py`、
+  `tests/test_harness.py`、`tests/test_flow.py`、`tests/test_flow_langgraph.py`、
+  `tests/test_create_domain.py`、`tests/test_app_shells.py`、
   `tests/test_template_boundary.py`（改内核路由前必须先跑）。
 - 跳过项：`tests/test_milvus_integration.py`，需要真实 Milvus。
 - 已知无害日志：测试结束时 `milvus_lite` 可能打印
@@ -589,6 +604,8 @@ bash scripts/verify.sh
 - 新增需追问要素的意图必须在插件 manifest 声明 `required_slots` / `slot_labels`；新增有业务图的
   插件必须声明 `graph_keys`；需要不同循环/上下文裁剪的领域在 `build_services` 注册
   `ctx.harnesses`；改 SSE 序列时同步前端静态节点与序列断言测试。
+- 需要长程业务循环时优先用 `agent_core/flow` 的 `FlowEngine` / `FlowNodes`：
+  `flow` 管业务下一步，`harness` 管执行资源；不要把 `plan/observe/confirm` 重复塞进 Harness。
 - 修改行为、配置、接口、RAG 或意图链路时，同步更新：
   - `README.md`
   - `Architecture.md`

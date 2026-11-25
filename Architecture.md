@@ -44,6 +44,7 @@
   confirmation.py : 写操作确认闸门（按清单确定性裁决，写操作绝不落自由问答）
   clarification.py : 澄清闸门（required_slots / 低置信候选，确定性追问，不调用模型）
   harness/    : 执行面策略（Harness + 循环/上下文/工具/预算），领域可按域名覆盖
+  flow/       : 业务控制层（plan/assemble/execute/observe/decide + 版本/确认/轨迹）
   security.py : 统一认证与生产密钥校验；sse.py : SSE 帧编码（app.py 已接入）
   intent/     : JEV / LLM / Hybrid / Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
        |
@@ -107,7 +108,7 @@
 | 层 | 位置 | 职责 | 是否认识业务 |
 |---|---|---|---|
 | 内核装配 | `app_factory.py`（组合根 `app.py` / `apps/*`） | `create_app(registry=)` 装配全局、注册通用路由、提供 lifespan | 否（只认插件协议） |
-| 内核能力 | `agent_core/` | plugins 契约、认证、SSE、意图路由框架、执行面 Harness 策略 | 否 |
+| 内核能力 | `agent_core/` | plugins 契约、认证、SSE、意图路由框架、执行面 Harness 策略、业务控制层骨架 | 否 |
 | 领域插件 | `domains/<域>/` | 服务装配、图构建、领域专属路由 | 是（各领域自持） |
 
 **PluginRegistry 是唯一启用开关**：`domains/registry.py` 的 `default_registry()` 返回要启用的插件列表。
@@ -151,6 +152,16 @@ create_app(registry)
    -> HarnessRegistry 按 domain 选择执行面策略（循环/上下文/工具/预算）
         默认 Harness 不改变 SSE 事件序列；领域可只换 policy 或重写 stream_answer / run_graph
 ```
+
+**业务控制层（可选，`agent_core/flow/`）**：面向续保、审批、多轮写操作这类长程任务，
+提供 `FlowEngine` 的 `plan → assemble → execute → observe → decide` 有界循环。
+领域实现 `FlowNodes`；`VersionedFacts` 维护事实版本/失效，`PendingAction` +
+`ConfirmExecutor` 负责版本 / TTL / 载荷 / 幂等，`FlowTrace` 记录决策依据。
+默认最多 20 步、连续 2 轮无进展转人工。**flow 决定业务下一步，harness 决定执行资源**；
+需要 LangGraph checkpoint / HITL 时用 `build_flow_graph(nodes, checkpointer=saver)` 把
+`FlowNodes` 拆成 `plan / assemble / execute / observe / decide` 子图；确认拆成
+`request_confirm` + `wait_confirm`，确保待确认动作先入 checkpoint 再 `interrupt`。
+契约由 `tests/test_flow.py`、`tests/test_flow_langgraph.py` 守护。
 
 `configs/domains.yaml` 已瘦身为只含 general 的回退清单；完整三域清单由
 `domains.registry.default_domain_registry()` 从插件聚合。新增领域只需在插件目录写

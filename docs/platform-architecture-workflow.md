@@ -519,6 +519,7 @@ ObjectStore:  Local    → S3 / OSS
 | `agents/assistant_agent.py` | 领域无关的对话编排图：`classify`（意图路由 + 清单校验）→ `plan` trace → 按 `capability` 分派 |
 | `agent_core/capabilities.py` | 对话编排能力表：内置 `answer` / `guard` / `clarify`，其余由领域注册；`missing_handlers` 供启动校验 |
 | `agent_core/clarification.py` | 澄清闸门：按 `required_slots` / `needs_clarification` 确定性裁决，文案来自 manifest |
+| `agent_core/flow/` | 业务控制层：`FlowEngine` / `FlowNodes`、版本事实、确认幂等与结构化轨迹；`build_flow_graph` 提供 LangGraph 子图适配；与执行面 Harness 分层 |
 | `domains/*/assistant_handlers.py` | 领域侧对话能力实现（保单查询、材料门控、核赔、投资 RAG、交易拦截） |
 | `agents/claim_agent.py` | 理赔案件状态机、三专家、`route_decision` |
 | `agents/middleware_audit.py` | PII 脱敏、限流、缓存、审计、HITL |

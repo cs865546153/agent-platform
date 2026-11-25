@@ -27,7 +27,8 @@ KERNEL_FILES = [
     'domains/base.py',
     'models/workbench.py',
 ] + [f'agent_core/intent/{path.name}' for path in (ROOT / 'agent_core' / 'intent').glob('*.py')] \
-  + [f'agent_core/harness/{path.name}' for path in (ROOT / 'agent_core' / 'harness').glob('*.py')]
+  + [f'agent_core/harness/{path.name}' for path in (ROOT / 'agent_core' / 'harness').glob('*.py')] \
+  + [f'agent_core/flow/{path.name}' for path in (ROOT / 'agent_core' / 'flow').glob('*.py')]
 
 # 意图字符串只属于领域清单（manifest.yaml / DomainManifest）。
 INTENT_STRINGS = [

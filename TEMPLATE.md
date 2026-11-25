@@ -22,6 +22,7 @@ agent_core/                领域无关内核
   ├─ confirmation.py       写操作确认闸门：按清单确定性裁决，写操作绝不落到自由问答
   ├─ clarification.py      澄清闸门：required_slots / 低置信候选，确定性追问且不调用模型
   ├─ harness/              执行面策略：Harness + 循环/上下文/工具/预算，领域可按需覆盖
+  ├─ flow/                 业务控制层：plan/assemble/execute/observe/decide + 版本/确认/轨迹
   ├─ security.py           统一认证唯一事实源（API_KEY 优先，CLAIMS_API_KEY 兼容旧部署）
   ├─ sse.py                SSE 帧编码（已接入 app.py，无内联副本）
   └─ intent/               JEV/LLM/Hybrid/Shadow（清单从插件 manifest 聚合，YAML 仅回退 general）
@@ -65,11 +66,76 @@ configs/domains.yaml       运行时回退清单：只保留无插件领域（ge
 | 写操作确认闸门 | `agent_core/confirmation.py`（`ConfirmGate` 确定性裁决） | 写操作意图在 manifest 声明 `confirmation`（指向独立 API）；内核自动拦截并引导，不执行动作 |
 | 澄清闸门 | `agent_core/clarification.py`（`ClarifyGate` 确定性裁决） | 需要要素的意图在 manifest 声明 `required_slots` / `slot_labels`；缺槽位或低置信由内核 `clarify` 追问 |
 | 执行面策略 | `agent_core/harness/`（`Harness` + `LoopPolicy` / `ContextPolicy` / `ToolPolicy` / `BudgetPolicy`） | 需要不同循环或上下文裁剪时，在 `build_services` 写 `ctx.harnesses.register('my_domain', Harness(...))` |
+| 业务控制层（可选） | `agent_core/flow/`（`FlowEngine` + `FlowNodes` + `VersionedFacts` + `PendingAction` / `ConfirmExecutor` + `FlowTrace`） | 需要 `plan → assemble → execute → observe → decide`、版本事实、确认幂等或结构化轨迹时，在领域图/服务中组合 |
 | 多路召回 + RRF + BGE-Rerank + 引用校验 | `tools/knowledge_rag.py`、`tools/rerank.py` | 可选复用 |
 | HITL（中断 + 恢复 + 人工审批） | LangGraph `interrupt` + `domains/base.py:gate_resume/resume_gate` | 图内声明中断，恢复门控用基类 |
 | SSE 流式回答 | `app_factory.py` assistant 路由 + `agent_core/sse.py` | 否 |
 | Prometheus / LangFuse / 日志脱敏 | `monitoring.py`（`METRIC_PREFIX` 可配、插件可 `register_counter`）、`agents/observability.py` | 否 |
 | 上线门禁 / 影子对拍 | `deploy/regression_gate.py`、`deploy/shadow_mode.py` | 否 |
+
+### 2.1 业务控制层怎么用（可选）
+
+`agent_core/flow/` 和 `agent_core/harness/` 不是一回事：
+
+- `flow`：决定业务下一步，负责 `plan → assemble → execute → observe → decide`、事实版本、确认与转人工；
+- `harness`：决定执行资源，负责步数、上下文裁剪、工具白名单、预算与流式钩子。
+
+需要长程业务循环时，领域实现 `FlowNodes`，再在领域图节点、服务或路由中调用 `FlowEngine`：
+
+```python
+from agent_core.flow import (
+    ContextAssembler, Decision, DecisionKind, Execution, FlowEngine,
+    Observation, ObservationKind, Plan, VersionedFacts, build_flow_graph, new_state,
+)
+from agent_core.harness import ContextPolicy, LoopPolicy
+
+class MyNodes:
+    async def plan(self, state):
+        return Plan(actions=({'tool': 'query'},))
+
+    async def assemble(self, state, plan):
+        return ContextAssembler(
+            policy=ContextPolicy(max_tokens=4000),
+            pinned_facts=('budget', 'active_quote'),
+        ).assemble_state([], state)
+
+    async def execute(self, state, context):
+        return Execution(outputs=('ok',), tool_calls=1)
+
+    async def observe(self, state, execution):
+        return Observation(ObservationKind.SUCCESS)
+
+    def decide(self, state, observation):
+        return Decision(DecisionKind.DONE)
+
+    async def escalate(self, state, reason):
+        state['stop_reason'] = reason
+        return state
+
+    async def finish(self, state, status):
+        return state
+
+engine = FlowEngine(MyNodes(), loop=LoopPolicy(max_steps=12), max_no_progress=2)
+state = new_state('thread-1', facts={'budget': 3000}, versions={'budget': 1})
+result = await engine.run(state)
+
+# 需要 LangGraph checkpoint / HITL 时，用同一套 FlowNodes 编译成子图
+graph = build_flow_graph(
+    MyNodes(), loop=LoopPolicy(max_steps=12), checkpointer=saver,
+)
+result = await graph.ainvoke(
+    new_state('thread-1', facts={'budget': 3000}, versions={'budget': 1}),
+    {'configurable': {'thread_id': 'thread-1'}},
+)
+```
+
+约定：
+
+- `FlowEngine` 默认最多 20 步、连续 2 轮无进展转人工；`LoopPolicy` 只报告超限，`escalate` 由业务节点决定如何收场。
+- `CONFIRM` 决策必须带 `PendingAction`；恢复后用 `validate_pending_action` / `ConfirmExecutor` 校验版本、TTL、载荷与幂等。
+- `VersionedFacts` 只保留一个当前版本；确认与写操作必须绑定版本，旧版本只能拒绝并重算。
+- `FlowTrace` 记录 `plan_created / context_assembled / tool_called / observation_created / decision_made / escalated` 等事件，领域自行脱敏后落盘。
+- 需要 LangGraph checkpoint / HITL 时，用 `build_flow_graph(MyNodes(), checkpointer=saver)` 把 `FlowNodes` 拆成 `plan / assemble / execute / observe / decide` 子图；确认会停在 `wait_confirm`，恢复后带 `confirmation` 回到 `plan`。`FlowEngine` 与子图共享同一套 `FlowNodes`，不替代领域图。
 
 ---
 
@@ -280,22 +346,25 @@ pytest -q                                        # 全量
 - **真实联调未完成**：本地 LLM、Milvus、Redis、LangFuse、核心业务系统需按部署环境接入；
   模板不虚构准确率、延迟或成本。详见 `docs/` 各专题与 `deploy/runbook.md`。
 - **进程内限流/锁**：多副本部署需替换为 Redis；`AppContext.locks` 是进程内实现。
-- **关于 Harness**：本项目新增的 `agent_core/harness/` 是**执行面策略**（循环/上下文/
-  工具/预算），与培训材料里未被官方 SDK 证实的 `deep_agents.Harness` 不是同一概念；
-  主链路仍使用 LangGraph 显式状态机，`isolated_deep/` 里的官方 `create_deep_agent`
-  隔离验证**主 app 未接入**。
+- **关于 Harness / Flow**：`agent_core/harness/` 是**执行面策略**（循环/上下文/
+  工具/预算）；`agent_core/flow/` 是**业务控制层**（plan/assemble/execute/observe/decide、
+  版本事实、确认幂等、轨迹）。二者都不是培训材料里未被官方 SDK 证实的
+  `deep_agents.Harness`；主链路仍使用 LangGraph 显式状态机，`isolated_deep/` 里的官方
+  `create_deep_agent` 隔离验证**主 app 未接入**。
 
 ---
 
 ## 5. 验证基线（2026-11-25）
 
-- `258 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；写操作确认闸门 11 条
+- `275 passed, 1 skipped`（跳过项为需真实 Milvus 的集成测试）；写操作确认闸门 11 条
   契约 + 澄清闸门 9 条契约（槽位 / 意图候选 / 轮次上限 / 优先级 / 图内追问 / 清单声明）
-  + 执行面 harness 7 条契约 + create-domain 脚手架 4 条契约 + 薄应用入口 3 条契约
+  + 执行面 harness 7 条契约 + 业务控制层 17 条契约（含 LangGraph 子图 5 条）
+  + create-domain 脚手架 4 条契约 + 薄应用入口 3 条契约
 - Ruff 本次改动文件全部通过
 - 可插拔契约由 `tests/test_domain_plugin_template.py`、`tests/test_intent_plugin_template.py`、
   `tests/test_capabilities.py`、`tests/test_confirmation_gate.py`、`tests/test_clarify_gate.py`、
-  `tests/test_harness.py`、`tests/test_create_domain.py`、`tests/test_app_shells.py`、
+  `tests/test_harness.py`、`tests/test_flow.py`、`tests/test_flow_langgraph.py`、
+  `tests/test_create_domain.py`、`tests/test_app_shells.py`、
   `tests/test_template_boundary.py` 守护
 - 真实装配冒烟：`/health`、`/ready`、`/openapi.json` 均 200，19 条路由全部注册；
   `/ready` 额外校验插件 `graph_keys` 声明的 `claims` / `investment` 两张图；
