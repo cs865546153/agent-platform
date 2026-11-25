@@ -110,7 +110,7 @@ static/                 工作台前端
 tests/                  pytest 测试
 vendor/                 Python 3.15 下使用的纯 Python PyYAML wheel
 .opencode/skills/       本机 Agent 技能（vps-trojan-proxy 等），与业务运行时代码无关
-invest.md               投资域链路草稿；claims-ai-agent-architecture.html 为架构可视化
+invest.md               投资域链路草稿；agent-platform-template-architecture.html 为架构可视化
 .workbuddy/             个人工作记忆（非规范，不作为实现依据）
 .data/                  运行期数据，已 gitignore
 ```

@@ -1,4 +1,4 @@
-# 企业级 Agent 模板架构（Claims AI Agent）
+# 企业级 Agent 平台模板架构（Agent Platform Template）
 
 > 内核 + 领域插件；理赔 / 投资 / 通用知识库 RAG 为随模板提供的示例领域。
 > 使用与扩展方法见 [TEMPLATE.md](TEMPLATE.md)，本文描述系统实际如何组织。
