@@ -2,7 +2,7 @@
 
 只在服务器容器内运行，不进入应用运行链路：
 
-    docker run --rm -v /opt/agent-platform-template/models:/models \
+    docker run --rm -v /opt/agent-platform/models:/models \
       claims-model-downloader python scripts/download_models.py
 """
 from __future__ import annotations

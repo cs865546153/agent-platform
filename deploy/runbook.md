@@ -1,6 +1,6 @@
 # 运维与回退
 
-> 下文默认服务器目录为 `/opt/agent-platform-template`；未迁移时用
+> 下文默认服务器目录为 `/opt/agent-platform`；未迁移时用
 > `REMOTE_DIR=/实际路径` 覆盖 `scripts/deploy_vps.sh`。
 
 部署前先运行单元测试和固定数据集评测门禁；模型准确率、5秒延迟、成本预算均须实测。不要把教学阈值当成线上SLA。单实例SQLite用于示例持久化；横向扩容必须统一检查点、会话鉴权、案件锁、幂等存储，当前配置不能直接增加workers。
@@ -20,7 +20,7 @@ LangFuse使用独立Compose文件，必须配置数据库密码、认证secret�
 
 - `scripts/deploy_vps.sh` 用 rsync 同步代码，但明确排除 `.env` / `.env.*`；
   `INTENT_ROUTER_ENABLED`、`INTENT_ENGINE`、`JEV_API_KEY` 只在服务器
-  `/opt/agent-platform-template/.env` 维护，不会随部署更新。
+  `/opt/agent-platform/.env` 维护，不会随部署更新。
 - 只同步 `--static-only` 只更新前端，不重建镜像、不更新 `.env`。
 - 改完 `.env` 必须重建容器，否则 `env_file` 不生效：
 

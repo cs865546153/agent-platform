@@ -1,6 +1,6 @@
-# Agent Platform Template：统一接入 + 可插拔领域 + 理赔 / 投资 / 通用知识库 RAG
+# Agent Platform：统一接入 + 可插拔领域 + 理赔 / 投资 / 通用知识库 RAG
 
-> 项目名与仓库目录：**Agent Platform Template**（`agent-platform-template`）。
+> 项目名与仓库目录：**Agent Platform**（`agent-platform`）。
 
 面向理赔审核、投资知识问答和通用知识库问答的 Agent 平台模板。主应用使用 **FastAPI + LangGraph**，核心能力包括：
 
@@ -79,7 +79,7 @@ macOS 自带的 `/usr/bin/python3` 通常是 3.9.6，**低于项目要求的 3.1
 #查看端口是否被占用
 lsof -ti tcp:8001 | xargs ps -o pid,ppid,command -p
 
-cd /Users/Song/workspace/agent-platform-template
+cd /Users/Song/workspace/agent-platform
 bash scripts/set_deepseek_key.sh   # 首次：交互式写入 DeepSeek Key 并校验（不回显）
 bash scripts/start_mac.sh          # 启动；任意目录执行都可以，自动切根目录 + 选 venv
 bash scripts/start_mac.sh --app=apps.claims_app:app  # 只装理赔领域
@@ -89,8 +89,8 @@ bash scripts/start_mac.sh --app=apps.claims_app:app  # 只装理赔领域
 > **最容易踩的坑：同名 `.venv-py315`。** 仓库里 `My_Study/Python/` 也有一个学习用的 `.venv-py315`，激活后提示符一模一样，但里面只有 pytest/openai/rich/mypy 等，**没有 uvicorn/FastAPI**，于是报 `command not found: uvicorn`。启动前先自检：
 >
 > ```bash
-> pwd              # 必须是 .../agent-platform-template
-> which python     # 必须是 .../agent-platform-template/.venv-py315/bin/python
+> pwd              # 必须是 .../agent-platform
+> which python     # 必须是 .../agent-platform/.venv-py315/bin/python
 > which uvicorn    # 找不到就说明目录或环境不对
 > ```
 
@@ -125,7 +125,7 @@ brew install python@3.15
 ### 2. 创建虚拟环境并安装依赖
 
 ```bash
-cd /Users/Song/workspace/agent-platform-template
+cd /Users/Song/workspace/agent-platform
 python3.15 -m venv .venv-py315
 source .venv-py315/bin/activate
 python -m pip install -U pip
@@ -213,9 +213,9 @@ sed -i '' 's/^BUSINESS_MODE=.*/BUSINESS_MODE=demo/' .env
 **推荐用启动脚本**（任意目录执行都行，会自动切到项目根目录、挑选可用 venv，并默认开启热重载）：
 
 ```bash
-bash /Users/Song/workspace/agent-platform-template/scripts/start_mac.sh              # 默认 8001，热重载开
-bash /Users/Song/workspace/agent-platform-template/scripts/start_mac.sh 8002         # 换端口
-bash /Users/Song/workspace/agent-platform-template/scripts/start_mac.sh --no-reload  # 关闭热重载
+bash /Users/Song/workspace/agent-platform/scripts/start_mac.sh              # 默认 8001，热重载开
+bash /Users/Song/workspace/agent-platform/scripts/start_mac.sh 8002         # 换端口
+bash /Users/Song/workspace/agent-platform/scripts/start_mac.sh --no-reload  # 关闭热重载
 ```
 
 手动启动时等价于：
@@ -322,7 +322,7 @@ Apple Silicon 上应用容器为 arm64。若 `--profile infra` 的 Milvus 拉不
 ## 结构与职责
 
 ```text
-agent-platform-template/
+agent-platform/
 ├── app.py                      # FastAPI 路由、lifespan、SSE、工作台接口
 ├── settings.py                 # Pydantic 环境配置与密钥校验
 ├── config.py                   # 模型工厂、缓存和任务参数
@@ -551,7 +551,7 @@ bash scripts/start_mac.sh --no-reload  # 关闭热重载
 .venv-py315/bin/uvicorn app:app --host 127.0.0.1 --port 8001
 ```
 
-启动后访问 `http://127.0.0.1:8001/` 使用 Agent Platform Template 工作台。页面采用普通对话形式，支持理赔、投资和通用咨询，支持多轮意图识别、PDF/DOCX/文本抽取、图片视觉识别，以及结合识别结果的流式问答。点击“离线载入演示”可用固定合成案件运行完整状态机，查看报案、保单、三专家、置信度和决策链路；“真实理赔演示”会调用真实模型和内存条款跑判责 RAG，但不连接真实业务系统。两个入口都在生产环境自动禁用。页面右侧「调用链路 → 平台内核 → 领域意图路由」会显示实际引擎（JEV / LLM / 内置分类）、是否兜底和影子一致性，消息意图徽章也会带引擎标签；IntentRouter 读取最近 12 轮对话和上一轮意图（作为 active_domain 提示）：省略主语的追问继承当前主题，明确的新问题允许切换主题。材料审核会按附件类型核查保单信息、事故/出险证明和费用/损失凭证；缺失时保留累计附件并最多回流追问三轮，仍不完整则建议转人工，材料补齐后轮次清零并继续理赔链路。五类理赔意图进入理赔专用提示和合规约束；投资/一般咨询交给对应提示和通用基模回答。附件仅在请求内存中处理，不落盘；图片识别要求配置的模型支持 OpenAI 兼容多模态消息。
+启动后访问 `http://127.0.0.1:8001/` 使用 Agent Platform 工作台。页面采用普通对话形式，支持理赔、投资和通用咨询，支持多轮意图识别、PDF/DOCX/文本抽取、图片视觉识别，以及结合识别结果的流式问答。点击“离线载入演示”可用固定合成案件运行完整状态机，查看报案、保单、三专家、置信度和决策链路；“真实理赔演示”会调用真实模型和内存条款跑判责 RAG，但不连接真实业务系统。两个入口都在生产环境自动禁用。页面右侧「调用链路 → 平台内核 → 领域意图路由」会显示实际引擎（JEV / LLM / 内置分类）、是否兜底和影子一致性，消息意图徽章也会带引擎标签；IntentRouter 读取最近 12 轮对话和上一轮意图（作为 active_domain 提示）：省略主语的追问继承当前主题，明确的新问题允许切换主题。材料审核会按附件类型核查保单信息、事故/出险证明和费用/损失凭证；缺失时保留累计附件并最多回流追问三轮，仍不完整则建议转人工，材料补齐后轮次清零并继续理赔链路。五类理赔意图进入理赔专用提示和合规约束；投资/一般咨询交给对应提示和通用基模回答。附件仅在请求内存中处理，不落盘；图片识别要求配置的模型支持 OpenAI 兼容多模态消息。
 
 也可先停止8001端口的现有本项目服务，再运行`bash scripts/verify.sh`完成启动与pytest两条验证链路（`scripts/*.sh`为Bash脚本，Windows需在Git Bash或WSL中运行）。
 
@@ -783,7 +783,7 @@ curl -s http://127.0.0.1:8001/api/rag/answer \
 
 ## 部署到 VPS：`/ai` 子路径（已验证）
 
-> 以下路径假设服务器目录已迁移到 `/opt/agent-platform-template`。若服务器尚未迁移，
+> 以下路径假设服务器目录已迁移到 `/opt/agent-platform`。若服务器尚未迁移，
 > 部署时用 `REMOTE_DIR=/实际路径 ./scripts/deploy_vps.sh` 覆盖，迁移完成后再切默认值。
 
 下面这套方式适合单机 VPS：FastAPI 在容器内监听 `127.0.0.1:8001`，Embedding / Reranker 在独立容器内监听 `8010`，nginx 把 `/ai/` 反代到应用根路径。静态资源使用相对路径，因此同一份前端既能在本地 `/` 工作，也能在线上 `/ai/` 工作。
@@ -791,7 +791,7 @@ curl -s http://127.0.0.1:8001/api/rag/answer \
 ### 1. 目录与依赖
 
 ```text
-/opt/agent-platform-template/
+/opt/agent-platform/
 ├── app/                     # 代码（或直接把仓库放在这里）
 ├── data/                    # 知识库源文件，只读挂载
 ├── .data/                   # Milvus Lite、SQLite、日志，持久化
@@ -819,8 +819,8 @@ echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
 ```bash
 docker run --rm \
-  -v /opt/agent-platform-template/models:/models \
-  -v /opt/agent-platform-template/scripts:/scripts \
+  -v /opt/agent-platform/models:/models \
+  -v /opt/agent-platform/scripts:/scripts \
   -e MODEL_DIR=/models \
   python:3.12-slim \
   sh -c 'pip install -q huggingface_hub && python /scripts/download_models.py'
@@ -856,7 +856,7 @@ JEV_API_KEY=...
 ### 4. 构建与启动
 
 ```bash
-cd /opt/agent-platform-template
+cd /opt/agent-platform
 docker compose -f docker-compose.prod.yml build
 docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml ps
@@ -924,7 +924,7 @@ location /ai/ { return 301 https://$host$request_uri; }
 
 ```ini
 [Unit]
-Description=Agent Platform Template (Docker Compose)
+Description=Agent Platform (Docker Compose)
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -932,9 +932,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/opt/agent-platform-template
-ExecStart=/usr/bin/docker compose -f /opt/agent-platform-template/docker-compose.prod.yml up -d --no-build
-ExecStop=/usr/bin/docker compose -f /opt/agent-platform-template/docker-compose.prod.yml down
+WorkingDirectory=/opt/agent-platform
+ExecStart=/usr/bin/docker compose -f /opt/agent-platform/docker-compose.prod.yml up -d --no-build
+ExecStop=/usr/bin/docker compose -f /opt/agent-platform/docker-compose.prod.yml down
 TimeoutStartSec=0
 
 [Install]
@@ -987,10 +987,10 @@ rsync -az \
   --exclude '.git' --exclude '.env' --exclude '.data' \
   --exclude '.venv*' --exclude '__pycache__' \
   --exclude 'models/bge-m3' --exclude 'models/bge-reranker-base' \
-  ./ vps:/opt/agent-platform-template/
+  ./ vps:/opt/agent-platform/
 
 # 2) 重建并重启
-ssh vps 'cd /opt/agent-platform-template && \
+ssh vps 'cd /opt/agent-platform && \
   docker compose -f docker-compose.prod.yml build app embed && \
   docker compose -f docker-compose.prod.yml up -d --no-build embed && \
   docker compose -f docker-compose.prod.yml up -d --no-build --force-recreate app'
@@ -1016,7 +1016,7 @@ ssh vps 'curl -fsS http://127.0.0.1:8001/health && echo && \
 知识库更新：
 
 ```bash
-ssh vps 'cd /opt/agent-platform-template && \
+ssh vps 'cd /opt/agent-platform && \
   docker compose -f docker-compose.prod.yml exec app python scripts/build_investment_rag.py && \
   docker compose -f docker-compose.prod.yml exec app python scripts/build_knowledge_rag.py --domain general && \
   docker compose -f docker-compose.prod.yml restart app'
@@ -1036,7 +1036,7 @@ ssh vps 'docker tag claims-agent:prod claims-agent:backup-$(date +%Y%m%d%H%M)'
 
 ```bash
 ssh vps 'docker tag claims-agent:backup-202610261200 claims-agent:prod && \
-  cd /opt/agent-platform-template && \
+  cd /opt/agent-platform && \
   docker compose -f docker-compose.prod.yml up -d --no-build --force-recreate app'
 ```
 

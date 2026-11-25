@@ -17,7 +17,7 @@ set -euo pipefail
 REMOTE="${REMOTE:-vps}"
 # 服务器目录尚未迁移时可显式覆盖：
 # REMOTE_DIR=/实际路径 ./scripts/deploy_vps.sh
-REMOTE_DIR="${REMOTE_DIR:-/opt/agent-platform-template}"
+REMOTE_DIR="${REMOTE_DIR:-/opt/agent-platform}"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
